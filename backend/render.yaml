@@ -1,0 +1,13 @@
+# Deployment configuration for Render.com
+# This file tells Render how to build and run our backend service.
+# Render reads it automatically when the repo is connected.
+services:
+  - type: web
+    name: smart-contract-audit-backend
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false   #TODO set manually in Render dashboard
+    autoDeploy: true
