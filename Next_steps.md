@@ -13,3 +13,5 @@ The idea is to brainstorm improvements, bugs to fix, and new features, so we can
    Currently, smart contracts + prompts cannot be very long, and we may only be able to analyze around 15 per day before reaching the token limit.
 2. Collect a dataset of Smart Contracts with labeled vulnerabilities (through SmartBugs dataset)
 3. Implement evaluation pipeline.
+4. Add INFO category as a card in Frontend
+5. Enhance Slither formating in frontend
