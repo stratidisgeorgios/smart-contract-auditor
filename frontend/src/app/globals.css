@@ -1,0 +1,115 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*Downloading the letter fonts from Google Fonts 
+Oxanium for headings and display text 
+Space Mono for code, labels and monospace UI elements
+DM Sans for body text*/
+@import url('https://fonts.googleapis.com/css2?family=Oxanium:wght@400;600;700;800&family=Space+Mono:wght@400;700&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,300&display=swap');
+
+
+/*CSS variables are defined here and reused in other places of the code.*/
+:root {
+  --font-oxanium: 'Oxanium', sans-serif;
+  --font-space-mono: 'Space Mono', monospace;
+  --font-dm-sans: 'DM Sans', sans-serif;
+  --grad: linear-gradient(90deg, #00D4FF 0%, #9B4DFF 50%, #FF2D7C 100%); /*The main gradient*/
+  --grad-135: linear-gradient(135deg, #00D4FF 0%, #9B4DFF 50%, #FF2D7C 100%);
+  --bg-base: #080C14;  /* Dark background colours*/
+  --bg-surface: #0D1526;
+  --bg-card: #111D30;
+  --bg-border: #1C2D45;
+}
+
+* { box-sizing: border-box; } /*Border-box sizing*/
+html { scroll-behavior: smooth; } /* Smooth scrolling when clicking anchor links */
+
+body {
+  background-color: var(--bg-base);
+  color: #E2E8F0;
+  font-family: var(--font-dm-sans);
+  min-height: 100vh;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: radial-gradient(circle, rgba(0,212,255,0.05) 1px, transparent 1px);
+  background-size: 28px 28px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+::-webkit-scrollbar { width: 5px; } /* Custom scrollbar styles */
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: #1C2D45; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,212,255,0.25); }
+
+.grad-border { /*Gradient border effect*/
+  position: relative;
+  background: var(--bg-surface);
+  border-radius: 16px;
+  isolation: isolate;
+}
+.grad-border::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: 17px;
+  background: var(--grad-135);
+  z-index: -1;
+  opacity: 0.65;
+}
+
+.grad-text { /*Text with gradient colors*/
+  background: var(--grad);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.grad-btn { /*Gradient button: "Detect Vulnerabilities" */
+  background: var(--grad);
+  transition: opacity 0.2s, transform 0.15s;
+}
+.grad-btn:hover { opacity: 0.88; }
+
+@keyframes scanLine { /* Scan line animation while waiting for backend to respond*/
+  0%   { top: -2px; opacity: 1; } /*starts above the container (top: -2px) and exits at the bottom (top: 100%),
+   fading out as it leaves.*/
+  90%  { opacity: 1; }
+  100% { top: 100%; opacity: 0; }
+}
+.scan-line {
+  position: absolute;
+  left: 0; right: 0;
+  height: 2px;
+  background: var(--grad);
+  animation: scanLine 2.4s linear infinite;
+  box-shadow: 0 0 16px rgba(155,77,255,0.7); /* purple glow under the line */
+}
+
+.scan-grid { /* Grid pattern shown behind the radar during the scanning */
+  background-image:
+    linear-gradient(rgba(0,212,255,0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,45,124,0.05) 1px, transparent 1px);
+  background-size: 36px 36px;
+}
+
+/*Utility animations*/
+@keyframes fadeIn  { from { opacity: 0 } to { opacity: 1 } } /* Fades an element in from invisible to fully visible */
+@keyframes slideUp { from { opacity: 0; transform: translateY(14px) } to { opacity: 1; transform: translateY(0) } } /* Slides an element up from slightly below while fading it in */
+@keyframes critPulse { /* Pulsing red glow used on CRITICAL vulnerability cards */
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.4); }
+  50%       { box-shadow: 0 0 0 6px rgba(239,68,68,0); }
+}
+@keyframes radarSweep { /* Full 360° rotation (used on the radar sweep arm) */
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.animate-fade-in  { animation: fadeIn  0.35s ease-out; }
+.animate-slide-up { animation: slideUp 0.4s ease-out; }
+.animate-crit     { animation: critPulse 2s ease infinite; }
