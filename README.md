@@ -1,93 +1,200 @@
-# blockchain-seminar-smart-contract-auditor
+# Smart Contract Auditor —> Project Overview
+
+A web app that lets you upload a Solidity smart contract and get back a detailed security report.
+It combines two analysis engines: an LLM (via Groq) for semantic understanding, and Slither for
+precise static analysis. The two results are merged and deduplicated before being sent to the UI.
 
 
-
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## How it works —> the big picture
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.uzh.ch/smart-contract-auditor/blockchain-seminar-smart-contract-auditor.git
-git branch -M main
-git push -uf origin main
+User uploads .sol file
+        │
+        ▼
+  [Next.js Frontend]
+  Sends file to backend via POST /api/v1/audit
+        │
+        ▼
+  [FastAPI Backend]
+  Runs the audit pipeline:
+    1. Validate  →  basic sanity checks on the file
+    2. LLM node  →  sends code to Groq (llama-3.3-70b), gets back vulnerabilities in JSON
+    3. Slither   →  runs static analysis locally, gets back precise line numbers
+    4. Merge     →  deduplicates findings from both engines, builds the final report
+        │
+        ▼
+  Returns JSON report
+        │
+        ▼
+  [Next.js Frontend]
+  Renders the report: stats bar, sidebar list, vulnerability detail panel
 ```
 
-## Integrate with your tools
+## Backend
 
-* [Set up project integrations](https://gitlab.uzh.ch/smart-contract-auditor/blockchain-seminar-smart-contract-auditor/-/settings/integrations)
+The backend is a **Python + FastAPI** app deployed on Render via Docker.
 
-## Collaborate with your team
+### Entry point —> `main.py`
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+Boots the FastAPI app, sets up logging, and registers the API routes.
+It also configures CORS so the frontend (on a different domain) is allowed to call the API.
 
-## Test and Deploy
+### API —> `routes.py`
 
-Use the built-in continuous integration in GitLab.
+Two endpoints:
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+| Endpoint | What it does |
+|---|---|
+| `POST /api/v1/audit` | Accepts a `.sol` file upload, runs the pipeline, returns the JSON report |
+| `GET /api/v1/health` | Simple liveness check used by Render to know the server is up |
 
-***
+Before handing the file to the pipeline, the route validates it:
+- Must be a `.sol` file
+- Must not be empty
+- Must be under 500 KB
+- Must be valid UTF-8 text
 
-# Editing this README
+### Pipeline —> `graph.py`
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+The audit logic is built as a **LangGraph** graph. a directed flow of nodes where each step
+reads from a shared state dict, does its work, and writes its results back.
 
-## Suggestions for a good README
+```
+START → validate → llm_analysis → slither_analysis → merge_reports → END
+                ↘ abort → END   (if the file is completely empty)
+```
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+The shared state (`state.py`) acts like a whiteboard that every node can read and write.
+It holds the contract code, intermediate results from each node, and a list of non-fatal errors.
 
-## Name
-Choose a self-explaining name for your project.
+### Node 1 —> `llm_node.py`
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+Sends the contract to the **Groq API** (free LLM hosting) and asks it to find vulnerabilities.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+- Model used: `llama-3.3-70b-versatile`
+- The LLM receives a detailed system prompt from `data/instructions/prompt.txt`
+- It returns a structured JSON with vulnerability descriptions, exploitation scenarios,
+  recommendations, and approximate line numbers
+- Because LLMs sometimes wrap JSON in markdown fences, the node strips those before parsing
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+**What the LLM is good at:** understanding *what* the code does and *why* something is dangerous.
+Rich prose descriptions, exploitation scenarios, and fix recommendations.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+**What the LLM is bad at:** pinpointing the exact line number where a bug lives.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+### Node 2 —> `slither_node.py`
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+Runs **Slither**, an open-source static analyser for Solidity, as a local subprocess.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+Before running it, the node:
+1. Reads the `pragma solidity` version from the contract source
+2. Installs that exact compiler version via `solc-select` if it's not already present
+3. Switches to it so Slither compiles the contract correctly
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+Slither produces a JSON file listing every issue it detected, including the exact line numbers
+from the compiler. The node normalises these into the same schema the LLM node uses.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+**What Slither is good at:** compiler-verified line numbers, fast pattern detection, no hallucination.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+**What Slither is bad at:** it has no understanding of *why* something is dangerous, just that
+a known pattern was matched.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+### Node 3 —> `merge_node.py`
 
-## License
-For open source projects, say how it is licensed.
+Combines the findings from both engines into one clean, deduplicated list.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Deduplication works in two steps:
+1. **Exact SWC ID match** —> if both engines flagged the same weakness class (e.g. SWC-107 Reentrancy), they're merged into one finding tagged `source: "BOTH"`
+2. **Category keyword overlap** —> if there's no SWC ID, it checks if the category names share more than 40% of their words
+
+When two findings are merged, the result gets the **LLM's prose** (richer descriptions)
+and **Slither's line numbers** (more accurate). If they disagreed on severity, the higher rating wins.
+
+The final list is sorted by severity (CRITICAL first) and wrapped in the report object
+that gets sent back to the frontend.
+
+
+## Frontend
+
+The frontend is a **Next.js + TypeScript** app styled with **Tailwind CSS**.
+It has two screens: the upload form and the report view.
+
+### Tooling / config files
+
+| File | Purpose |
+|---|---|
+| `package.json` | Project dependencies and npm scripts (`dev`, `build`, `start`) |
+| `next.config.js` | Next.js settings (currently empty — defaults are fine) |
+| `tailwind.config.ts` | Custom colour palette, font families, and which files Tailwind scans |
+| `postcss.config.js` | Tells PostCSS to run Tailwind and Autoprefixer on every CSS file |
+| `tsconfig.json` | TypeScript compiler settings, including the `@/*` path alias |
+| `globals.css` | Global styles: fonts, dark background, custom scrollbar, reusable CSS classes |
+| `layout.tsx` | Root shell that wraps every page (sets the HTML `<title>` and loads global CSS) |
+
+### Types —> `report.ts`
+
+Defines the TypeScript shape of every object the backend returns.
+If the backend changes its response format, TypeScript will immediately flag the mismatch.
+
+Key types:
+- `AuditReport` — the root object returned by the API
+- `Vulnerability` — a single finding with severity, description, line numbers, source, etc.
+- `Severity` — `CRITICAL | HIGH | MEDIUM | LOW | INFO`
+- `Source` — `LLM | SLITHER | BOTH`
+
+### Screen 1 —> `page.tsx` (upload form)
+
+Manages the overall app state with four possible values: `idle → scanning → done | error`.
+
+**idle:** Shows the file upload box and the "Detect Vulnerabilities" button (disabled until a file is selected).
+
+**scanning:** Hides the form and shows an animated radar icon with a rotating status message
+(e.g. "Detecting reentrancy patterns…"). Messages cycle every ~2 seconds via `setInterval`.
+
+**done:** Unmounts the upload screen entirely and renders `<ReportView>` instead.
+
+**error:** Shows the error message returned by the backend and a "Try again" button.
+
+When the user picks a file, the page reads its text content immediately so it can later pass it
+to the report view for accurate line highlighting.
+
+### Upload component —> `FileUpload.tsx`
+
+A drag-and-drop file picker that only accepts `.sol` files.
+- Shows the filename and file size once a file is selected, with a "Remove" button to clear it
+
+### Screen 2 —> `ReportView.tsx` (audit results)
+
+The main results dashboard. Laid out in three sections:
+
+**Header card** —> shows the contract filename, Solidity version, line count, and which
+analysis engines were active (GenAI always on; Slither shows green only if it ran successfully).
+
+**Stats bar** —> five cards showing the count of findings per severity level (CRITICAL, HIGH, MEDIUM, LOW, Total).
+
+**Two-column panel:**
+- *Left sidebar* —> scrollable list of vulnerability titles. Clicking one selects it.
+  Initially shows the first 7 findings; a "Show N more" button reveals the rest.
+- *Right panel* —> full detail of the selected vulnerability:
+  - Severity badge + title + description
+  - Impact (exploitation scenario)
+  - Location (code viewer with highlighted lines)
+  - Recommendation (how to fix it)
+  - Bottom row: confidence ring, "Detected By" badges (LLM / Slither / Both), category + SWC ID
+
+#### Code viewer (`CodeBlock`)
+
+Shows the vulnerable lines with 3 lines of surrounding context and highlights them in red.
+
+Finding the right lines is a three-step fallback:
+1. **Search the file** for the LLM's `affected_code_snippet` text —<> fixes cases where the LLM
+   returned a wrong line number (e.g. line 1 as a fallback)
+2. **Use backend line numbers** if the search finds nothing
+3. **Show the raw snippet** as-is if no file content was passed in
+
+The code is colourised by a lightweight inline tokeniser (no external library) that handles
+Solidity keywords, strings, numbers, and comments.
+
+
+The only secret the backend needs is `GROQ_API_KEY`, set manually in the Render dashboard. (already set)
+The only thing the frontend needs is `NEXT_PUBLIC_API_URL` pointing to the Render backend URL. (already set)
