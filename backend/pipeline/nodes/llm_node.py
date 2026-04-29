@@ -19,9 +19,10 @@ INSTRUCTIONS_PATH = ( # Path to the text file that contains the system prompt we
 )
 
 # The Groq model to use. llama-3.3-70b-versatile is the best free option for code analysis at the time of writing. (april 2026)
-LLM_MODEL = "llama-3.3-70b-versatile"
+#Change to llama-3.1-8b-instant for the evaluation in order to save cost.
+LLM_MODEL = "llama-3.1-8b-instant" #"llama-3.3-70b-versatile"#
 LLM_TEMPERATURE = 0.1 # Low temperature -> more focused, deterministic output. We don't want the model to be creative as we want consistent JSON and secure outputs.
-LLM_MAX_TOKENS = 4096
+LLM_MAX_TOKENS = 2048 #4096 # Reduced from 4096 for 8b model: still sufficient for vulnerability analysis, saves 50% tokens  
 
 
 def _load_system_prompt() -> str:
