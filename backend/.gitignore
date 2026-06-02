@@ -6,3 +6,5 @@ __pycache__/
 dist/
 .pytest_cache/
 .CLAUDE.md
+frontend/next-env.d.ts
+VulnerableBank_Short_Slither.sol
