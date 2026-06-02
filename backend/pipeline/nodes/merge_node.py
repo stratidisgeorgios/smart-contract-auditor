@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 SEVERITY_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1} # Numeric index for each severity level, used for sorting and comparison. A higher number means more severity.
 
-_DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile" # Default model name used in the report metadata if the LLM didn't report which model it used
+_DEFAULT_LLM_MODEL = "llama-3.1-8b-instant" # Default model name used in the report metadata if the LLM didn't report which model it used
 
 
 def _overall_risk(vulns: list[dict]) -> str:
@@ -73,10 +73,15 @@ def _merge(llm_v: dict, sli_v: dict) -> dict:
     
     merged = {**llm_v, "source": "BOTH", "slither_check": sli_v.get("slither_check")} # Starting from the LLM finding and add Slither-specific fields
 
-    # We prefer Slither line numbers because they are exact. If none, then we fall back to LLM provided ones
-    if sli_v.get("line_numbers"):
-        merged["line_numbers"] = sli_v["line_numbers"]
-    elif not merged.get("line_numbers"):
+    # Line number strategy —> we prefer LLM lines over Slither lines. Slither often reports entire function bodies or includes called-function lines, producing wide ranges like [93..119] that miss the GT.
+    # The LLM resolver gives targeted lines. Only fall back to Slither if LLM has none.
+    llm_lines = llm_v.get("line_numbers", [])
+    sli_lines = sli_v.get("line_numbers", [])
+    if llm_lines:
+        merged["line_numbers"] = llm_lines # trust the resolver
+    elif sli_lines:
+        merged["line_numbers"] = sli_lines # fallback: at least Slither has something
+    else:
         merged["line_numbers"] = []
 
     # Take the more severe rating
@@ -89,17 +94,65 @@ def _merge(llm_v: dict, sli_v: dict) -> dict:
     return merged
 
 
+def _dedup_slither(vulns: list[dict]) -> list[dict]:
+    """
+    Deduplicate Slither's internal sub-checks that map to the same category.
+
+    Slither reports reentrancy-eth, reentrancy-no-eth, reentrancy-benign as
+    separate findings —> all normalize to "reentrancy" in the evaluation.
+    If multiple sub-checks point to overlapping lines in the same contract,
+    keeping all of them inflates FP count unfairly.
+
+    Strategy: for each normalized category, keep only the finding whose line
+    range best covers the smallest span (most precise). Remove others that
+    overlap within ±5 lines.
+    """
+    if not vulns:
+        return vulns
+
+    kept = []
+    for vuln in vulns:
+        cat   = vuln.get("category", "").lower().replace("-", " ")
+        lines = vuln.get("line_numbers", [])
+
+        duplicate = False
+        for existing in kept:
+            ex_cat   = existing.get("category", "").lower().replace("-", " ")
+            ex_lines = existing.get("line_numbers", [])
+            if ex_cat != cat:
+                continue
+        
+            if not lines or not ex_lines:
+                duplicate = True
+                break
+            if any(abs(l - e) <= 5 for l in lines for e in ex_lines):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(vuln)
+
+    if len(kept) < len(vulns):
+        logger.info(
+            "[Merge] Slither dedup: %d → %d findings (%d sub-check duplicates removed)",
+            len(vulns), len(kept), len(vulns) - len(kept),
+        )
+    return kept
+
+
 def run_merge_node(state: AuditState) -> AuditState:
     """LangGraph node that merges LLM and Slither findings and builds the final report."""
     logger.info("[LOG] Merge node")
     errors = list(state.get("errors", []))
 
     # Extract vulnerability lists from previous nodes 
-    llm_analysis   = (state.get("llm_report") or {}).get("llm_analysis", {})
-    llm_vulns      = llm_analysis.get("vulnerabilities", [])
-    slither_vulns  = (state.get("slither_report") or {}).get("vulnerabilities", [])
+    llm_analysis = (state.get("llm_report") or {}).get("llm_analysis", {})
+    llm_vulns = llm_analysis.get("vulnerabilities", [])
+    slither_vulns_raw = (state.get("slither_report") or {}).get("vulnerabilities", [])
 
-    merged: list[dict] = []  # the final combined list we'll build up
+
+    slither_vulns = _dedup_slither(slither_vulns_raw)
+
+    merged: list[dict] = []  
     slither_used: set[int] = set() # track which Slither findings have already been merged
 
      # Step 1: Match each LLM finding against Slither findings
@@ -166,11 +219,11 @@ def run_merge_node(state: AuditState) -> AuditState:
         "vulnerabilities":  merged,
     }
 
-    # Final report (debug log)
-    logger.info("━" * 50)
-    logger.info("FINAL REPORT")
-    logger.info("━" * 50)
-    logger.info(json.dumps(final_report, indent=2, ensure_ascii=False))
-    logger.info("━" * 50)
+    # Final report —> debug only
+    logger.debug("━" * 50)
+    logger.debug("FINAL REPORT")
+    logger.debug("━" * 50)
+    logger.debug(json.dumps(final_report, indent=2, ensure_ascii=False))
+    logger.debug("━" * 50)
 
     return {**state, "final_report": final_report, "errors": errors}

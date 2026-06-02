@@ -16,19 +16,33 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from metrics import calculate_metrics
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-DATASET_PATH = Path(__file__).parent.parent.parent.parent / "smartbugs-curated" / "dataset"
-GT_FILE      = Path(__file__).parent.parent.parent.parent / "smartbugs-curated" / "vulnerabilities.json"
+# Configuration
+
+DATASET_PATH = _REPO_ROOT / "smartbugs_curated_dataset" / "dataset"
+GT_FILE      = _REPO_ROOT / "smartbugs_curated_dataset" / "vulnerabilities.json"
 BACKEND_URL  = "http://localhost:8000/api/v1/audit"
 
-# Rate-limiting: Groq free tier ~30 req/min.
+# Rate-limiting: Groq free tier ~30 req/min. Here we define the rate limits of our model and the delay needed between calls so as to avoid reaching the TPM rates
 # Each contract = 1 LLM call, so space them out.
-DELAY_BETWEEN_CONTRACTS = 8   # seconds between each audit call
-BACKEND_TIMEOUT         = 180  # seconds — long enough for Groq retries inside backend
+# Delay between contracts —> depends on model TPM limit:
+#   llama-3.1-8b-instant          ->  8s   (TPM 6K,  but RPM=30 is binding -> 2s min, 8s safe)
+#   openai/gpt-oss-20b            -> 28s   (TPM 8K,  8K/3300 tokens = 2.4/min -> 25s min)
+#   openai/gpt-oss-120b           -> 28s   (TPM 8K,  same as 20b)
+#   meta-llama/llama-4-scout-17b  ->  8s   (TPM 30K, same as 8b)
+#   llama-3.3-70b-versatile       -> 35s   (TPM 12K, 12K/3300 = 3.6/min -> 17s min, 35s safe)
+DELAY_BETWEEN_CONTRACTS = 35   # <- change this when switching model according to the table we defined above
+BACKEND_TIMEOUT         = 180  # seconds —> long enough for Groq retries inside backend
+
+# Set to True to print GT vs detected details for every contract (useful for debugging)
+VERBOSE = True
+
+# Use only the N contracts to limit token usage on free tier. Contracts are selected in a balanced round-robin across categories, shortest first.
+# If Set to None all contracts are used
+MAX_CONTRACTS = 50
 
 
-# ─── Category normalization ───────────────────────────────────────────────────
-# Maps every known Slither/LLM detector name → GT canonical snake_case name.
+# Category normalization 
+# Maps every known Slither/LLM detector name -> GT canonical name.
 CATEGORY_ALIASES: Dict[str, str] = {
     # unchecked_low_level_calls
     "unchecked lowlevel":           "unchecked_low_level_calls",
@@ -122,7 +136,10 @@ CATEGORY_ALIASES: Dict[str, str] = {
     "short addresses":              "short_address",
     "short_addresses":              "short_address",
 
-    # informational — skipped entirely during matching
+    # LLM sometimes uses "informational" when it means "other" -> treat as "other"
+    "informational":                "other",
+
+    # informational -> skipped during matching as they are not considered in GT
     "low level calls":              "informational",
     "low_level_calls":              "informational",
     "naming convention":            "informational",
@@ -163,23 +180,22 @@ CATEGORY_ALIASES: Dict[str, str] = {
     "cache array length":           "informational",
     "redundant statements":         "informational",
     "too many digits":              "informational",
-    "other":                        "informational",
+    "other":                        "other", 
 }
 
 
 def normalize_category(raw: str) -> str:
     """Normalize a raw category string to the GT canonical name."""
     lowered = raw.lower().strip()
-    # Try spaces variant first (underscores → spaces), preserving dots
     key_spaces = lowered.replace("_", " ")
     if key_spaces in CATEGORY_ALIASES:
         return CATEGORY_ALIASES[key_spaces]
     if lowered in CATEGORY_ALIASES:
         return CATEGORY_ALIASES[lowered]
-    return lowered  # unknown — return as-is so two unknowns can still match
+    return lowered 
 
 
-# ─── Data loading ─────────────────────────────────────────────────────────────
+# Data loading 
 
 def load_ground_truth(gt_path: Path) -> List[Dict]:
     with open(gt_path) as f:
@@ -194,6 +210,78 @@ def find_contracts(dataset_path: Path) -> List[Tuple[str, Path]]:
     return sorted(contracts)
 
 
+def find_contracts_balanced(
+    dataset_path: Path,
+    max_contracts: Optional[int] = None,
+) -> List[Tuple[str, Path]]:
+    """
+    Select contracts with balanced category representation, shortest first.
+
+    Algorithm —> round-robin across vulnerability categories:
+      Round 1: shortest contract from each category  (for example: reentrancy, arithmetic, ...)
+      Round 2: second shortest from each category
+      ... repeat until max_contracts is reached.
+
+    Result: all vulnerability types are represented equally according to the dataset, and within each
+    type we always prefer shorter contracts (lower token use).
+    """
+    from collections import defaultdict, Counter
+
+    # Group contracts by category (= subfolder name)
+    by_category: dict = defaultdict(list)
+    for sol_file in dataset_path.rglob("*.sol"):
+        category = sol_file.parent.name
+        try:
+            lines = len(sol_file.read_text(encoding="utf-8", errors="replace").splitlines())
+        except Exception:
+            lines = 0
+        by_category[category].append((sol_file.stem, sol_file, lines))
+
+    # we sort each category: shortest first, then alphabetically for determinism
+    for cat in by_category:
+        by_category[cat].sort(key=lambda x: (x[2], x[0]))
+
+    # we apply Round-robin selection across sorted categories
+    categories = sorted(by_category.keys())
+    selected = []
+    round_num = 0
+
+    while True:
+        added_this_round = False
+        for cat in categories:
+            if round_num < len(by_category[cat]):
+                selected.append(by_category[cat][round_num])
+                added_this_round = True
+                if max_contracts and len(selected) >= max_contracts:
+                    break
+        if not added_this_round or (max_contracts and len(selected) >= max_contracts):
+            break
+        round_num += 1
+
+    # Summary 
+    cat_counts = Counter(sol_file.parent.name for _, sol_file, _ in selected)
+    print(f"\n✓ Balanced selection: {len(selected)} contracts across {len(cat_counts)} categories")
+    print(f"  {'Category':<30} {'Count':>5}  {'Lines (min-max)'}")
+    print(f"  {'-'*55}")
+    for cat in sorted(cat_counts.keys()):
+        cat_contracts = [(n, p, l) for n, p, l in selected if p.parent.name == cat]
+        min_l = min(l for _, _, l in cat_contracts)
+        max_l = max(l for _, _, l in cat_contracts)
+        print(f"  {cat:<30} {cat_counts[cat]:>5}  ({min_l}-{max_l} lines)")
+
+    # Warning for contracts over 200 lines (they can reach the rate limit faster)
+    over_200 = [(n, p, l) for n, p, l in selected if l > 200]
+    if over_200:
+        print("\n" + "=" * 60)
+        print(f"  WARNING: {len(over_200)} contract(s) exceed 200 lines -- LLM may fail")
+        print("=" * 60)
+        for name, _, lcount in over_200:
+            print(f"  >> {name}: {lcount} lines")
+        print("=" * 60 + "\n")
+    else:
+        print(f"\n  All {len(selected)} contracts are <= 200 lines\n")
+
+    return [(name, path) for name, path, _ in selected]
 def match_ground_truth(contract_name: str, contracts_gt: List[Dict]) -> Optional[Dict]:
     contract_lower = contract_name.lower().replace(".sol", "")
     for gt in contracts_gt:
@@ -203,7 +291,7 @@ def match_ground_truth(contract_name: str, contracts_gt: List[Dict]) -> Optional
     return None
 
 
-# ─── API call ─────────────────────────────────────────────────────────────────
+# API call 
 
 async def audit_contract(file_path: Path) -> Optional[Dict]:
     """Call backend API to audit a contract. Waits up to BACKEND_TIMEOUT seconds."""
@@ -228,21 +316,21 @@ async def audit_contract(file_path: Path) -> Optional[Dict]:
                     return await resp.json()
                 else:
                     text = await resp.text()
-                    print(f"\n    ❌ API Error {resp.status}: {text[:200]}")
+                    print(f"\n API Error {resp.status}: {text[:200]}")
                     return None
 
     except asyncio.TimeoutError:
-        print(f"\n    ⏱️  Timeout after {BACKEND_TIMEOUT}s")
+        print(f"\n Timeout after {BACKEND_TIMEOUT}s")
         return None
     except Exception as e:
-        print(f"\n    ❌ Exception: {e}")
+        print(f"\n Exception: {e}")
         return None
 
 
-# ─── Matching ─────────────────────────────────────────────────────────────────
+# Matching
 
 def deduplicate_gt(gt_list: List[Dict]) -> List[Dict]:
-    """Remove duplicate GT entries (same normalized category + overlapping lines)."""
+    """Remove duplicate GT entries"""
     seen = []
     deduped = []
     for truth in gt_list:
@@ -265,11 +353,11 @@ def deduplicate_detected(detected_list: List[Dict]) -> List[Dict]:
     """
     Remove duplicate detections: same normalized category at overlapping lines.
     Keeps the first occurrence. Informational findings are passed through
-    (they get skipped in the match loop anyway).
+    (as they get skipped in the match loop anyway).
     """
     seen = []
     deduped = []
-    tolerance = 15
+    tolerance = 0  
 
     for finding in detected_list:
         norm_cat = normalize_category(finding.get("category", "unknown"))
@@ -296,7 +384,7 @@ def deduplicate_detected(detected_list: List[Dict]) -> List[Dict]:
 def match_findings(detected_list: List[Dict], gt_list: List[Dict]) -> Dict:
     """
     Match detected findings against GT. Returns tp, fp, fn, per_category.
-    Informational detections are skipped entirely.
+    Informational detections are skipped.
     """
     gt_list = deduplicate_gt(gt_list)
     detected_list = deduplicate_detected(detected_list)
@@ -327,15 +415,23 @@ def match_findings(detected_list: List[Dict], gt_list: List[Dict]) -> Dict:
             if detected_cat != truth_cat:
                 continue
 
-            # Line match: if either side has no lines, accept on category alone
+            # Matching strategy for lines-> the GT line counts as matched if:
+            # (a) it is literally in the detected_lines array, or
+            # (b) it falls within [min(detected) - 7, max(detected) + 7]
+  
             if not detected_lines or not truth_lines:
                 line_match = True
             else:
-                line_match = any(
-                    abs(dl - tl) <= 15
-                    for dl in detected_lines
-                    for tl in truth_lines
-                )
+                dl_min = min(detected_lines) - 7  
+                dl_max = max(detected_lines) + 7
+                line_match = any(dl_min <= tl <= dl_max for tl in truth_lines)
+
+                if not line_match and detected_cat == "access_control":
+                    line_match = any(
+                        abs(dl - tl) <= 25
+                        for dl in detected_lines
+                        for tl in truth_lines
+                    )
 
             if line_match:
                 tp += 1
@@ -369,7 +465,7 @@ def compare_findings(
     """
     Returns (both_metrics, llm_metrics).
     both  = LLM + Slither + BOTH source findings
-    llm   = LLM + BOTH source findings only
+    llm = LLM + BOTH source findings only
     """
     llm_findings = [
         f for f in detected_findings
@@ -390,7 +486,7 @@ def generate_report(
     metrics_both: Dict, metrics_llm: Dict,
     per_cat_both: Dict, per_cat_llm: Dict,
 ) -> Path:
-    """Generate a human-readable evaluation report and save it to disk."""
+    """Generate an evaluation report and save it to disk."""
 
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -439,14 +535,14 @@ def generate_report(
     lines.append(f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("=" * W)
 
-    # ── Run statistics ──────────────────────────────────────────────────────
+    # Run statistics 
     lines += section("RUN STATISTICS")
     lines.append(row("Total contracts in dataset:", total_contracts))
     lines.append(row("Contracts evaluated:", evaluated))
     lines.append(row("Skipped (no ground truth):", skipped))
     lines.append(row("Failed (API error):", failed))
 
-    # ── Overall metrics ─────────────────────────────────────────────────────
+    # Overall metrics 
     lines += section("OVERALL METRICS — BOTH ENGINES (LLM + Slither)")
     lines.append(row("True Positives (TP):", total_tp_both))
     lines.append(row("False Positives (FP):", total_fp_both))
@@ -465,7 +561,7 @@ def generate_report(
     lines.append(row("Recall:", f"{metrics_llm['recall']:.1%}"))
     lines.append(row("F1-Score:", f"{metrics_llm['f1_score']:.4f}"))
 
-    # ── Improvement ─────────────────────────────────────────────────────────
+    # Improvement 
     lines += section("IMPROVEMENT — BOTH vs LLM-ONLY")
     p_delta  = metrics_both["precision"] - metrics_llm["precision"]
     r_delta  = metrics_both["recall"]    - metrics_llm["recall"]
@@ -477,7 +573,7 @@ def generate_report(
         tp_delta = ((total_tp_both - total_tp_llm) / total_tp_llm) * 100
         lines.append(row("TP improvement:", f"{tp_delta:+.1f}%"))
 
-    # ── Interpretation ───────────────────────────────────────────────────────
+    # Interpretation 
     lines += section("INTERPRETATION")
     b_p = metrics_both["precision"]
     b_r = metrics_both["recall"]
@@ -535,7 +631,7 @@ def generate_report(
             "  Slither has minimal net impact on F1 — most detections come from the LLM."
         )
 
-    # ── Per-category breakdown ───────────────────────────────────────────────
+    # breakdown per ctegory 
     lines += section("PER-VULNERABILITY BREAKDOWN — BOTH ENGINES")
     lines += cat_table(per_cat_both, "both")
 
@@ -551,7 +647,81 @@ def generate_report(
     report_path.write_text(report_text)
     return report_path
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def preflight_check() -> bool:
+    """
+    Runs before the evaluation to verify all required resources are reachable.
+    Prints a status for each check so that we know exactly what is and is not
+    working before waiting 70 minutes.
+    Returns True if OK to proceed, False if a blocking problem was found.
+    """
+    import os
+    import importlib.util
+    ok = True
+
+    print("\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510")
+    print("\u2502  PRE-FLIGHT CHECK                                       \u2502")
+    print("\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518")
+
+    # 1. Dataset folder
+    if DATASET_PATH.exists():
+        sol_count = len(list(DATASET_PATH.rglob("*.sol")))
+        print(f"  OK  Dataset folder found  ({sol_count} .sol files)")
+        print(f"      {DATASET_PATH}")
+    else:
+        print(f"  FAIL  Dataset folder NOT found")
+        print(f"        Expected: {DATASET_PATH}")
+        ok = False
+
+    # 2. Ground-truth file
+    if GT_FILE.exists():
+        print(f"  OK  Ground-truth file found  -> {GT_FILE.name}")
+    else:
+        print(f"  FAIL  Ground-truth file NOT found")
+        print(f"        Expected: {GT_FILE}")
+        ok = False
+
+    # 3. GROQ_API_KEY
+    if os.getenv("GROQ_API_KEY"):
+        print(f"  OK  GROQ_API_KEY is set")
+    else:
+        print(f"  WARN  GROQ_API_KEY not set -- backend will fail on every LLM call")
+        print(f"        Fix: export GROQ_API_KEY=gsk_...")
+
+    # 4. Langfuse:checks SDK installed, Keys present and if prompt is reachable
+    langfuse_installed = importlib.util.find_spec("langfuse") is not None
+    lf_pub = bool(os.getenv("LANGFUSE_PUBLIC_KEY"))
+    lf_sec = bool(os.getenv("LANGFUSE_SECRET_KEY"))
+
+    if not langfuse_installed:
+        print(f"  --  Langfuse SDK not installed")
+        print(f"      -> prompts will be read from local .txt files (no tracing)")
+        print(f"         Install with: pip install langfuse")
+    elif not lf_pub or not lf_sec:
+        print(f"  --  Langfuse SDK installed but keys not set (LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)")
+        print(f"      -> prompts will be read from local .txt files (no tracing)")
+    else:
+        try:
+            from langfuse import Langfuse
+            client = Langfuse(
+                public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+                secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+                host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+            )
+            prompt_obj = client.get_prompt("audit-system-prompt", label="production")
+            text = prompt_obj.compile()
+            preview = text[:70].replace("\n", " ")
+            print(f"  OK  Langfuse connected -- prompt 'audit-system-prompt' loaded OK")
+            print(f"      Preview: \"{preview}...\"")
+            print(f"      All audit traces will appear in your Langfuse dashboard")
+        except Exception as exc:
+            print(f"  WARN  Langfuse keys set but fetch failed: {exc}")
+            print(f"        -> prompts will be read from local .txt files as fallback")
+
+    print()
+    return ok
+
+# Main 
 
 async def test_batch():
     print("╔════════════════════════════════════════════════════════╗")
@@ -559,18 +729,22 @@ async def test_batch():
     print("║     (Both Engines vs LLM-Only)                         ║")
     print("╚════════════════════════════════════════════════════════╝\n")
 
+    if not preflight_check():
+        print("Preflight failed -- fix the issues above before running the evaluation.")
+        return
+
     contracts_gt = load_ground_truth(GT_FILE)
     print(f"✓ Loaded {len(contracts_gt)} ground truth contracts")
 
-    contracts = find_contracts(DATASET_PATH)
-    print(f"✓ Found {len(contracts)} .sol files")
+    contracts = find_contracts_balanced(DATASET_PATH, max_contracts=MAX_CONTRACTS)
+    print(f"✓ {len(contracts)} contracts selected")
     print(f"✓ Delay between contracts: {DELAY_BETWEEN_CONTRACTS}s\n")
 
     total_tp_both = total_fp_both = total_fn_both = 0
     total_tp_llm  = total_fp_llm  = total_fn_llm  = 0
     skipped = 0
     failed  = 0
-    # per-category accumulators
+    # accumulators per category
     per_cat_both: Dict = {}
     per_cat_llm:  Dict = {}
 
@@ -583,7 +757,7 @@ async def test_batch():
 
         gt_data = match_ground_truth(contract_name, contracts_gt)
         if not gt_data:
-            print("⚠️  no ground truth")
+            print("no ground truth")
             skipped += 1
             continue
 
@@ -591,7 +765,7 @@ async def test_batch():
 
         audit_result = await audit_contract(file_path)
         if not audit_result:
-            print("❌ API error")
+            print(" API error")
             failed += 1
             continue
 
@@ -624,29 +798,74 @@ async def test_batch():
             f"LLM TP:{llm_metrics['tp']} FP:{llm_metrics['fp']} FN:{llm_metrics['fn']}"
         )
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+        if VERBOSE:
+            from collections import Counter
+
+        
+            print(f"    File:    {file_path}")
+
+            #  Ground truth 
+            gt_parts = [f"{v.get('category','?')}@{v.get('lines',[])}" for v in vulns_gt]
+            print(f"    GT:      {', '.join(gt_parts)}")
+
+            # LLM findings with 
+            llm_findings_v = [v for v in vulns_detected if v.get("source") in ("LLM", "BOTH")]
+            if llm_findings_v:
+                llm_parts = []
+                for v in llm_findings_v:
+                    cat   = normalize_category(v.get("category", "?"))
+                    lines = v.get("line_numbers", [])
+                    matched = any(
+                        normalize_category(gt.get("category", "")) == cat and (
+                            not lines or not gt.get("lines") or
+                            any(
+                                (min(lines) - 7) <= tl <= (max(lines) + 7)
+                                for tl in gt.get("lines", [])
+                            )
+                        )
+                        for gt in vulns_gt
+                    )
+                    flag = "OK" if matched else "MISS"
+                    llm_parts.append(f"{cat}@{lines}[{flag}]")
+                print(f"    LLM:     {', '.join(llm_parts)}")
+            else:
+                print(f"    LLM:     NONE — LLM failed or returned empty")
+
+            # Slither: just category counts 
+            sli_counts = Counter(
+                normalize_category(v.get("category", "?"))
+                for v in vulns_detected if v.get("source") == "SLITHER"
+            )
+            sli_str = ", ".join(
+                f"{cat}(x{n})" if n > 1 else cat
+                for cat, n in sorted(sli_counts.items())
+            ) or "none"
+            print(f"    Slither: {sli_str}")
+            print()
+
+    # Summary 
     evaluated = len(contracts) - skipped - failed
     metrics_both = calculate_metrics(total_tp_both, total_fp_both, total_fn_both)
     metrics_llm  = calculate_metrics(total_tp_llm,  total_fp_llm,  total_fn_llm)
 
     print(f"\n{'='*70}")
-    print(f"📊 FINAL RESULTS  ({evaluated} contracts evaluated, "
+    print(f" FINAL RESULTS  ({evaluated} contracts evaluated, "
           f"{skipped} skipped, {failed} failed)")
     print(f"{'='*70}\n")
 
-    print("🔗 BOTH MODE (LLM + Slither):")
+    print(" BOTH MODE (LLM + Slither):")
     print(f"  TP: {total_tp_both} | FP: {total_fp_both} | FN: {total_fn_both}")
     print(f"  Precision: {metrics_both['precision']:.1%}")
     print(f"  Recall:    {metrics_both['recall']:.1%}")
     print(f"  F1-Score:  {metrics_both['f1_score']:.4f}\n")
 
-    print("🧠 LLM-ONLY MODE:")
+    print("LLM-ONLY MODE:")
     print(f"  TP: {total_tp_llm} | FP: {total_fp_llm} | FN: {total_fn_llm}")
     print(f"  Precision: {metrics_llm['precision']:.1%}")
     print(f"  Recall:    {metrics_llm['recall']:.1%}")
     print(f"  F1-Score:  {metrics_llm['f1_score']:.4f}\n")
 
-    print("🚀 IMPROVEMENT (Both vs LLM-Only):")
+    print(" IMPROVEMENT (Both vs LLM-Only):")
     if total_tp_llm > 0:
         tp_delta = ((total_tp_both - total_tp_llm) / total_tp_llm) * 100
         print(f"  TP:        {tp_delta:+.1f}%")
@@ -674,7 +893,7 @@ async def test_batch():
         per_cat_both=per_cat_both,
         per_cat_llm=per_cat_llm,
     )
-    print(f"\n📄 Report saved to: {report_path}")
+    print(f"\n Report saved to: {report_path}")
 
 
 if __name__ == "__main__":

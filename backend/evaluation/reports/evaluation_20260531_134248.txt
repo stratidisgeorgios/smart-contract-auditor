@@ -1,0 +1,89 @@
+========================================================================
+  SMART CONTRACT AUDITOR � EVALUATION REPORT
+  Generated: 2026-05-31 13:42:48
+========================================================================
+LLM Model: openai/gpt-oss-120b
+========================================================================
+  RUN STATISTICS
+========================================================================
+  Total contracts in dataset:    50
+  Contracts evaluated:           50
+  Skipped (no ground truth):     0
+  Failed (API error):            0
+
+========================================================================
+  OVERALL METRICS � BOTH ENGINES (LLM + Slither)
+========================================================================
+  True Positives (TP):           45
+  False Positives (FP):          40
+  False Negatives (FN):          21
+
+  Precision:                     52.9%
+  Recall:                        68.2%
+  F1-Score:                      0.5960
+
+========================================================================
+  OVERALL METRICS � LLM-ONLY
+========================================================================
+  True Positives (TP):           44
+  False Positives (FP):          26
+  False Negatives (FN):          22
+
+  Precision:                     62.9%
+  Recall:                        66.7%
+  F1-Score:                      0.6471
+
+========================================================================
+  IMPROVEMENT � BOTH vs LLM-ONLY
+========================================================================
+  Precision delta:               -9.9%
+  Recall delta:                  +1.5%
+  F1-Score delta:                -0.0511
+  TP improvement:                +2.3%
+
+========================================================================
+  INTERPRETATION
+========================================================================
+  The combined (LLM + Slither) engine achieves moderate overall performance
+  with an F1-score of 0.596 (Precision 52.9%, Recall 68.2%).
+
+  Recall (68.2%) outpaces Precision (52.9%), meaning the system
+  catches most real vulnerabilities but also flags some false positives.
+
+  Slither introduces more false positives than true positives in this run.
+
+========================================================================
+  PER-VULNERABILITY BREAKDOWN � BOTH ENGINES
+========================================================================
+  Vulnerability                  TP   FP   FN  Precision  Recall      F1
+  ----------------------------------------------------------------------
+  access_control                  7    1    0     87.5% 100.0%  0.933
+  other                           2    0    1    100.0%  66.7%  0.800
+  reentrancy                      5    4    1     55.6%  83.3%  0.667
+  time_manipulation               5    3    2     62.5%  71.4%  0.667
+  bad_randomness                 10    5    6     66.7%  62.5%  0.645
+  denial_of_service               5    4    2     55.6%  71.4%  0.625
+  front_running                   3    1    4     75.0%  42.9%  0.545
+  unchecked_low_level_calls       5   15    1     25.0%  83.3%  0.385
+  arithmetic                      3    7    3     30.0%  50.0%  0.375
+  short_address                   0    0    1      0.0%   0.0%  0.000
+
+========================================================================
+  PER-VULNERABILITY BREAKDOWN � LLM-ONLY
+========================================================================
+  Vulnerability                  TP   FP   FN  Precision  Recall      F1
+  ----------------------------------------------------------------------
+  access_control                  7    0    0    100.0% 100.0%  1.000
+  reentrancy                      5    0    1    100.0%  83.3%  0.909
+  time_manipulation               5    0    2    100.0%  71.4%  0.833
+  other                           2    0    1    100.0%  66.7%  0.800
+  bad_randomness                 10    4    6     71.4%  62.5%  0.667
+  denial_of_service               5    4    2     55.6%  71.4%  0.625
+  front_running                   3    1    4     75.0%  42.9%  0.545
+  unchecked_low_level_calls       4   10    2     28.6%  66.7%  0.400
+  arithmetic                      3    7    3     30.0%  50.0%  0.375
+  short_address                   0    0    1      0.0%   0.0%  0.000
+
+========================================================================
+  END OF REPORT
+========================================================================
