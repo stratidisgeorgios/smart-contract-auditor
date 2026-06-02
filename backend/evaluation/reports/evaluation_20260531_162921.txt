@@ -1,0 +1,88 @@
+========================================================================
+  SMART CONTRACT AUDITOR � EVALUATION REPORT
+  Generated: 2026-05-31 16:29:21
+========================================================================
+LLM Model: openai/gpt-oss-20b 
+========================================================================
+  RUN STATISTICS
+========================================================================
+  Total contracts in dataset:    50
+  Contracts evaluated:           50
+  Skipped (no ground truth):     0
+  Failed (API error):            0
+
+========================================================================
+  OVERALL METRICS � BOTH ENGINES (LLM + Slither)
+========================================================================
+  True Positives (TP):           42
+  False Positives (FP):          24
+  False Negatives (FN):          24
+
+  Precision:                     63.6%
+  Recall:                        63.6%
+  F1-Score:                      0.6364
+
+========================================================================
+  OVERALL METRICS � LLM-ONLY
+========================================================================
+  True Positives (TP):           41
+  False Positives (FP):          7
+  False Negatives (FN):          25
+
+  Precision:                     85.4%
+  Recall:                        62.1%
+  F1-Score:                      0.7193
+
+========================================================================
+  IMPROVEMENT � BOTH vs LLM-ONLY
+========================================================================
+  Precision delta:               -21.8%
+  Recall delta:                  +1.5%
+  F1-Score delta:                -0.0829
+  TP improvement:                +2.4%
+
+========================================================================
+  INTERPRETATION
+========================================================================
+  The combined (LLM + Slither) engine achieves moderate overall performance
+  with an F1-score of 0.636 (Precision 63.6%, Recall 63.6%).
+
+  Precision and Recall are well balanced.
+
+  Slither introduces more false positives than true positives in this run.
+
+========================================================================
+  PER-VULNERABILITY BREAKDOWN � BOTH ENGINES
+========================================================================
+  Vulnerability                  TP   FP   FN  Precision  Recall      F1
+  ----------------------------------------------------------------------
+  denial_of_service               5    0    2    100.0%  71.4%  0.833
+  arithmetic                      6    3    0     66.7% 100.0%  0.800
+  other                           2    0    1    100.0%  66.7%  0.800
+  access_control                  7    4    0     63.6% 100.0%  0.778
+  unchecked_low_level_calls       6    5    0     54.5% 100.0%  0.706
+  reentrancy                      5    5    1     50.0%  83.3%  0.625
+  bad_randomness                  6    4   10     60.0%  37.5%  0.462
+  time_manipulation               3    3    4     50.0%  42.9%  0.462
+  front_running                   2    0    5    100.0%  28.6%  0.444
+  short_address                   0    0    1      0.0%   0.0%  0.000
+
+========================================================================
+  PER-VULNERABILITY BREAKDOWN � LLM-ONLY
+========================================================================
+  Vulnerability                  TP   FP   FN  Precision  Recall      F1
+  ----------------------------------------------------------------------
+  unchecked_low_level_calls       6    0    0    100.0% 100.0%  1.000
+  reentrancy                      5    0    1    100.0%  83.3%  0.909
+  denial_of_service               5    0    2    100.0%  71.4%  0.833
+  access_control                  6    2    1     75.0%  85.7%  0.800
+  arithmetic                      6    3    0     66.7% 100.0%  0.800
+  other                           2    0    1    100.0%  66.7%  0.800
+  time_manipulation               3    0    4    100.0%  42.9%  0.600
+  bad_randomness                  6    2   10     75.0%  37.5%  0.500
+  front_running                   2    0    5    100.0%  28.6%  0.444
+  short_address                   0    0    1      0.0%   0.0%  0.000
+
+========================================================================
+  END OF REPORT
+========================================================================
