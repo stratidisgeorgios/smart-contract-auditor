@@ -207,6 +207,23 @@ You should see `{"status":"ok"}`.
 
 ---
 
+## Required environment variables (Render dashboard)
+
+The backend requires three separate Groq API keys — one per debate node — so their token-per-minute buckets never overlap. Set all three in the Render dashboard under **Environment → Secret Files / Environment Variables**:
+
+| Variable | Used by | Required |
+|---|---|---|
+| `GROQ_API_KEY` | detect node + tiebreaker | Yes |
+| `GROQ_API_KEY_2` | critique node | Yes |
+| `GROQ_API_KEY_3` | verify node | Yes |
+| `LANGFUSE_PUBLIC_KEY` | prompt management & tracing | Optional |
+| `LANGFUSE_SECRET_KEY` | prompt management & tracing | Optional |
+| `LANGFUSE_HOST` | Langfuse instance URL | Optional (defaults to cloud.langfuse.com) |
+
+If `GROQ_API_KEY_2` or `GROQ_API_KEY_3` are not set, those nodes fall back to `GROQ_API_KEY`, which causes all three to share the same TPM bucket and will produce rate limit errors on larger contracts.
+
+---
+
 ## Troubleshooting
 
 **Docker build fails**
