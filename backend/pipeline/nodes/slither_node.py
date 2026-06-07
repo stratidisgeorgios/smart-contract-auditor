@@ -273,14 +273,14 @@ def run_slither_node(state: AuditState) -> AuditState:
 
             normalised = [_normalise(i + 1, d) for i, d in enumerate(detectors)] # Convert every raw finding into our internal schema
 
-            # Full Slither output for debug  
-            logger.info("━" * 50)
-            logger.info("SLITHER RAW OUTPUT")
-            logger.info("━" * 50)
-            logger.info(
+            # Full Slither output — debug only
+            logger.debug("━" * 50)
+            logger.debug("SLITHER RAW OUTPUT")
+            logger.debug("━" * 50)
+            logger.debug(
                 json.dumps({"findings": normalised, "raw": raw}, indent=2, ensure_ascii=False)
             )
-            logger.info("━" * 50)
+            logger.debug("━" * 50)
 
             return {
                 **state,

@@ -1,48 +1,48 @@
 #!/usr/bin/env python3
 """
-SmartBugs Curated dataset evaluation script - Batch mode.
-Tests all 143 contracts and measures accuracy with dual-engine comparison.
+Batch evaluation against the SmartBugs Curated dataset (143 contracts).
+Measures Precision / Recall / F1 across four modes:
+  - Raw detector output   (pre-debate)
+  - Raw Slither output    (pre-debate, MEDIUM+ only)
+  - Debate-confirmed LLM  (post-debate)
+  - Debate-confirmed Both (post-debate, LLM + Slither)
 """
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import aiohttp
 import sys
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")  # load GROQ / Langfuse keys
 
 from metrics import calculate_metrics
 
-# Configuration
-
-DATASET_PATH = _REPO_ROOT / "smartbugs_curated_dataset" / "dataset"
-GT_FILE      = _REPO_ROOT / "smartbugs_curated_dataset" / "vulnerabilities.json"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+_REPO_ROOT   = Path(__file__).parent.parent.parent
+DATASET_PATH = _REPO_ROOT / "smartbugs-curated" / "dataset"
+GT_FILE      = _REPO_ROOT / "smartbugs-curated" / "vulnerabilities.json"
 BACKEND_URL  = "http://localhost:8000/api/v1/audit"
 
-# Rate-limiting: Groq free tier ~30 req/min. Here we define the rate limits of our model and the delay needed between calls so as to avoid reaching the TPM rates
-# Each contract = 1 LLM call, so space them out.
-# Delay between contracts —> depends on model TPM limit:
-#   llama-3.1-8b-instant          ->  8s   (TPM 6K,  but RPM=30 is binding -> 2s min, 8s safe)
-#   openai/gpt-oss-20b            -> 28s   (TPM 8K,  8K/3300 tokens = 2.4/min -> 25s min)
-#   openai/gpt-oss-120b           -> 28s   (TPM 8K,  same as 20b)
-#   meta-llama/llama-4-scout-17b  ->  8s   (TPM 30K, same as 8b)
-#   llama-3.3-70b-versatile       -> 35s   (TPM 12K, 12K/3300 = 3.6/min -> 17s min, 35s safe)
-DELAY_BETWEEN_CONTRACTS = 35   # <- change this when switching model according to the table we defined above
-BACKEND_TIMEOUT         = 180  # seconds —> long enough for Groq retries inside backend
+# ── Timing ────────────────────────────────────────────────────────────────────
+# Each pipeline run uses 3 separate Groq keys (KEY1: detect+tiebreaker,
+# KEY2: critique, KEY3: verify). The tiebreaker guards 65s after detect on KEY1,
+# so 90s between contracts leaves 25s of headroom before the next detect.
+DELAY_BETWEEN_CONTRACTS = 90   # seconds between contracts
+BACKEND_TIMEOUT         = 400  # max seconds to wait for one audit API call
 
-# Set to True to print GT vs detected details for every contract (useful for debugging)
-VERBOSE = True
-
-# Use only the N contracts to limit token usage on free tier. Contracts are selected in a balanced round-robin across categories, shortest first.
-# If Set to None all contracts are used
-MAX_CONTRACTS = 50
+# ── Run options ───────────────────────────────────────────────────────────────
+VERBOSE       = True   # print GT vs detected per contract
+MAX_CONTRACTS = None   # None = all 143; set e.g. 20 for a quick test
 
 
-# Category normalization 
-# Maps every known Slither/LLM detector name -> GT canonical name.
+# ── Category normalisation ────────────────────────────────────────────────────
+# Maps every Slither detector name and LLM category variant → the GT canonical name.
 CATEGORY_ALIASES: Dict[str, str] = {
     # unchecked_low_level_calls
     "unchecked lowlevel":           "unchecked_low_level_calls",
@@ -185,7 +185,7 @@ CATEGORY_ALIASES: Dict[str, str] = {
 
 
 def normalize_category(raw: str) -> str:
-    """Normalize a raw category string to the GT canonical name."""
+    """Map a raw detector/LLM category string to the GT canonical name."""
     lowered = raw.lower().strip()
     key_spaces = lowered.replace("_", " ")
     if key_spaces in CATEGORY_ALIASES:
@@ -195,7 +195,7 @@ def normalize_category(raw: str) -> str:
     return lowered 
 
 
-# Data loading 
+# ── Data loading ──────────────────────────────────────────────────────────────
 
 def load_ground_truth(gt_path: Path) -> List[Dict]:
     with open(gt_path) as f:
@@ -215,19 +215,11 @@ def find_contracts_balanced(
     max_contracts: Optional[int] = None,
 ) -> List[Tuple[str, Path]]:
     """
-    Select contracts with balanced category representation, shortest first.
-
-    Algorithm —> round-robin across vulnerability categories:
-      Round 1: shortest contract from each category  (for example: reentrancy, arithmetic, ...)
-      Round 2: second shortest from each category
-      ... repeat until max_contracts is reached.
-
-    Result: all vulnerability types are represented equally according to the dataset, and within each
-    type we always prefer shorter contracts (lower token use).
+    Round-robin selection across vulnerability categories, shortest-first within each.
+    Ensures every category is represented before any category gets a second contract.
     """
     from collections import defaultdict, Counter
 
-    # Group contracts by category (= subfolder name)
     by_category: dict = defaultdict(list)
     for sol_file in dataset_path.rglob("*.sol"):
         category = sol_file.parent.name
@@ -237,11 +229,9 @@ def find_contracts_balanced(
             lines = 0
         by_category[category].append((sol_file.stem, sol_file, lines))
 
-    # we sort each category: shortest first, then alphabetically for determinism
     for cat in by_category:
-        by_category[cat].sort(key=lambda x: (x[2], x[0]))
+        by_category[cat].sort(key=lambda x: (x[2], x[0]))  # shortest first, alphabetical for ties
 
-    # we apply Round-robin selection across sorted categories
     categories = sorted(by_category.keys())
     selected = []
     round_num = 0
@@ -258,7 +248,6 @@ def find_contracts_balanced(
             break
         round_num += 1
 
-    # Summary 
     cat_counts = Counter(sol_file.parent.name for _, sol_file, _ in selected)
     print(f"\n✓ Balanced selection: {len(selected)} contracts across {len(cat_counts)} categories")
     print(f"  {'Category':<30} {'Count':>5}  {'Lines (min-max)'}")
@@ -269,7 +258,7 @@ def find_contracts_balanced(
         max_l = max(l for _, _, l in cat_contracts)
         print(f"  {cat:<30} {cat_counts[cat]:>5}  ({min_l}-{max_l} lines)")
 
-    # Warning for contracts over 200 lines (they can reach the rate limit faster)
+    # Contracts >200 lines trigger llama-4-scout (larger model) in the pipeline
     over_200 = [(n, p, l) for n, p, l in selected if l > 200]
     if over_200:
         print("\n" + "=" * 60)
@@ -291,13 +280,27 @@ def match_ground_truth(contract_name: str, contracts_gt: List[Dict]) -> Optional
     return None
 
 
-# API call 
+# ── API ───────────────────────────────────────────────────────────────────────
+
+def _strip_smartbugs_header(source: str) -> str:
+    """
+    Redact SmartBugs answer-key hints before sending to the LLM.
+    Operates in-place so line numbers are never shifted.
+
+    Removes:
+      @vulnerable_at_lines: N,M,...   → replaced with [redacted]  (header)
+      // <yes> <report> CATEGORY      → comment stripped, code kept  (inline)
+    """
+    source = re.sub(r"@vulnerable_at_lines:[^\n]*", "@vulnerable_at_lines: [redacted]", source)
+    source = re.sub(r"\s*//\s*<\w+>\s*<report>\s*[\w_]+", "", source)
+    return source
+
 
 async def audit_contract(file_path: Path) -> Optional[Dict]:
-    """Call backend API to audit a contract. Waits up to BACKEND_TIMEOUT seconds."""
+    """Send a contract to the backend and return the audit JSON."""
     try:
-        with open(file_path, "rb") as f:
-            file_content = f.read()
+        raw = file_path.read_text(encoding="utf-8", errors="replace")
+        file_content = _strip_smartbugs_header(raw).encode("utf-8")
 
         data = aiohttp.FormData()
         data.add_field(
@@ -327,10 +330,10 @@ async def audit_contract(file_path: Path) -> Optional[Dict]:
         return None
 
 
-# Matching
+# ── Matching ──────────────────────────────────────────────────────────────────
 
 def deduplicate_gt(gt_list: List[Dict]) -> List[Dict]:
-    """Remove duplicate GT entries"""
+    """Drop duplicate GT entries (same category + overlapping lines)."""
     seen = []
     deduped = []
     for truth in gt_list:
@@ -351,19 +354,24 @@ def deduplicate_gt(gt_list: List[Dict]) -> List[Dict]:
 
 def deduplicate_detected(detected_list: List[Dict]) -> List[Dict]:
     """
-    Remove duplicate detections: same normalized category at overlapping lines.
-    Keeps the first occurrence. Informational findings are passed through
-    (as they get skipped in the match loop anyway).
+    Collapse Slither-only duplicates (same category, same line).
+    LLM/BOTH findings are never collapsed — each instance can match a distinct GT entry.
+    Informational findings pass through unchanged.
     """
     seen = []
     deduped = []
-    tolerance = 0  
+    tolerance = 0
 
     for finding in detected_list:
         norm_cat = normalize_category(finding.get("category", "unknown"))
         if norm_cat == "informational":
             deduped.append(finding)
             continue
+
+        if finding.get("source") in ("LLM", "BOTH"):
+            deduped.append(finding)
+            continue
+
         lines = set(finding.get("line_numbers", []))
         duplicate = False
         for seen_cat, seen_lines in seen:
@@ -383,8 +391,14 @@ def deduplicate_detected(detected_list: List[Dict]) -> List[Dict]:
 
 def match_findings(detected_list: List[Dict], gt_list: List[Dict]) -> Dict:
     """
-    Match detected findings against GT. Returns tp, fp, fn, per_category.
-    Informational detections are skipped.
+    Score detected findings against ground truth.
+    Returns {tp, fp, fn, per_category}.
+
+    A detection matches a GT entry when:
+      - categories are the same (after normalisation), AND
+      - GT line falls within [min(detected) − 7, max(detected) + 7]
+      - access_control uses ±25 instead (function-level vulnerability)
+    Each GT entry can only be matched once.
     """
     gt_list = deduplicate_gt(gt_list)
     detected_list = deduplicate_detected(detected_list)
@@ -415,14 +429,10 @@ def match_findings(detected_list: List[Dict], gt_list: List[Dict]) -> Dict:
             if detected_cat != truth_cat:
                 continue
 
-            # Matching strategy for lines-> the GT line counts as matched if:
-            # (a) it is literally in the detected_lines array, or
-            # (b) it falls within [min(detected) - 7, max(detected) + 7]
-  
             if not detected_lines or not truth_lines:
                 line_match = True
             else:
-                dl_min = min(detected_lines) - 7  
+                dl_min = min(detected_lines) - 7
                 dl_max = max(detected_lines) + 7
                 line_match = any(dl_min <= tl <= dl_max for tl in truth_lines)
 
@@ -460,22 +470,29 @@ def match_findings(detected_list: List[Dict], gt_list: List[Dict]) -> Dict:
 
 def compare_findings(
     detected_findings: List[Dict],
+    raw_detect: List[Dict],
+    raw_slither: List[Dict],
     ground_truth_vulns: List[Dict],
-) -> Tuple[Dict, Dict]:
+) -> Tuple[Dict, Dict, Dict, Dict]:
     """
-    Returns (both_metrics, llm_metrics).
-    both  = LLM + Slither + BOTH source findings
-    llm = LLM + BOTH source findings only
+    Returns (debate_both, debate_llm, detect_only, slither_only).
+
+    debate_both   — post-debate confirmed findings (LLM + Slither + BOTH)
+    debate_llm    — post-debate confirmed LLM/BOTH findings only
+    detect_only   — raw LLM detect output before any debate filtering
+    slither_only  — raw Slither MEDIUM+ output before any debate filtering
     """
-    llm_findings = [
+    debate_llm_findings = [
         f for f in detected_findings
         if f.get("source") in ("LLM", "BOTH")
     ]
 
-    both_metrics = match_findings(detected_findings, ground_truth_vulns)
-    llm_metrics  = match_findings(llm_findings, ground_truth_vulns)
+    debate_both   = match_findings(detected_findings,    ground_truth_vulns)
+    debate_llm    = match_findings(debate_llm_findings,  ground_truth_vulns)
+    detect_only   = match_findings(raw_detect,           ground_truth_vulns)
+    slither_only  = match_findings(raw_slither,          ground_truth_vulns)
 
-    return both_metrics, llm_metrics
+    return debate_both, debate_llm, detect_only, slither_only
 
 
 
@@ -483,8 +500,12 @@ def generate_report(
     evaluated: int, skipped: int, failed: int, total_contracts: int,
     total_tp_both: int, total_fp_both: int, total_fn_both: int,
     total_tp_llm: int, total_fp_llm: int, total_fn_llm: int,
+    total_tp_detect: int, total_fp_detect: int, total_fn_detect: int,
+    total_tp_slither: int, total_fp_slither: int, total_fn_slither: int,
     metrics_both: Dict, metrics_llm: Dict,
+    metrics_detect: Dict, metrics_slither: Dict,
     per_cat_both: Dict, per_cat_llm: Dict,
+    per_cat_detect: Dict, per_cat_slither: Dict,
 ) -> Path:
     """Generate an evaluation report and save it to disk."""
 
@@ -494,25 +515,44 @@ def generate_report(
     reports_dir.mkdir(exist_ok=True)
     report_path = reports_dir / f"evaluation_{timestamp}.txt"
 
-    W = 72  # line width
+    W = 72
 
     def section(title):
-        lines = []
-        lines.append("")
-        lines.append("=" * W)
-        lines.append(f"  {title}")
-        lines.append("=" * W)
-        return lines
+        return ["", "=" * W, f"  {title}", "=" * W]
 
     def row(label, val, width=30):
         return f"  {label:<{width}} {val}"
 
-    def cat_table(per_cat, label):
-        lines = []
-        lines.append(f"  {'Vulnerability':<28} {'TP':>4} {'FP':>4} {'FN':>4}  "
-                     f"{'Precision':>9} {'Recall':>7} {'F1':>7}")
-        lines.append("  " + "-" * (W - 2))
-        # Sort by F1 descending
+    def metrics_block(tp, fp, fn, m):
+        out = []
+        out.append(row("True Positives  (TP):", tp))
+        out.append(row("False Positives (FP):", fp))
+        out.append(row("False Negatives (FN):", fn))
+        out.append("")
+        out.append(row("Precision:", f"{m['precision']:.1%}"))
+        out.append(row("Recall:",    f"{m['recall']:.1%}"))
+        out.append(row("F1-Score:",  f"{m['f1_score']:.4f}"))
+        return out
+
+    def delta_block(label_a, m_a, label_b, m_b):
+        """Show metric deltas: m_b − m_a (positive = m_b is better)."""
+        out = []
+        out.append(f"  {'':28} {'Precision':>9} {'Recall':>7} {'F1':>7}")
+        out.append("  " + "-" * (W - 2))
+        def _sign(v): return f"{v:+.1%}" if "%" not in f"{v}" else f"{v:+.4f}"
+        dp = m_b["precision"] - m_a["precision"]
+        dr = m_b["recall"]    - m_a["recall"]
+        df = m_b["f1_score"]  - m_a["f1_score"]
+        out.append(f"  {label_a:<28} {m_a['precision']:>8.1%} {m_a['recall']:>6.1%} {m_a['f1_score']:>6.3f}")
+        out.append(f"  {label_b:<28} {m_b['precision']:>8.1%} {m_b['recall']:>6.1%} {m_b['f1_score']:>6.3f}")
+        out.append(f"  {'Delta (b − a)':<28} {dp:>+8.1%} {dr:>+6.1%} {df:>+6.3f}")
+        return out
+
+    def cat_table(per_cat):
+        out = []
+        out.append(f"  {'Vulnerability':<28} {'TP':>4} {'FP':>4} {'FN':>4}  "
+                   f"{'Precision':>9} {'Recall':>7} {'F1':>7}")
+        out.append("  " + "-" * (W - 2))
         rows = []
         for cat, v in per_cat.items():
             if cat == "informational":
@@ -521,13 +561,13 @@ def generate_report(
             rows.append((cat, v, m))
         rows.sort(key=lambda x: x[2]["f1_score"], reverse=True)
         for cat, v, m in rows:
-            lines.append(
+            out.append(
                 f"  {cat:<28} {v['tp']:>4} {v['fp']:>4} {v['fn']:>4}  "
                 f"{m['precision']:>8.1%} {m['recall']:>6.1%} {m['f1_score']:>6.3f}"
             )
         if not rows:
-            lines.append("  (no data)")
-        return lines
+            out.append("  (no data)")
+        return out
 
     lines = []
     lines.append("=" * W)
@@ -535,116 +575,74 @@ def generate_report(
     lines.append(f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("=" * W)
 
-    # Run statistics 
+    # ── Run statistics ────────────────────────────────────────────────────────
     lines += section("RUN STATISTICS")
     lines.append(row("Total contracts in dataset:", total_contracts))
     lines.append(row("Contracts evaluated:", evaluated))
     lines.append(row("Skipped (no ground truth):", skipped))
     lines.append(row("Failed (API error):", failed))
 
-    # Overall metrics 
-    lines += section("OVERALL METRICS — BOTH ENGINES (LLM + Slither)")
-    lines.append(row("True Positives (TP):", total_tp_both))
-    lines.append(row("False Positives (FP):", total_fp_both))
-    lines.append(row("False Negatives (FN):", total_fn_both))
+    # ── Detector raw (pre-debate) ─────────────────────────────────────────────
+    lines += section("RAW DETECTOR ONLY  (pre-debate, LLM detect node)")
+    lines += metrics_block(total_tp_detect, total_fp_detect, total_fn_detect, metrics_detect)
+
+    # ── Slither raw (pre-debate) ──────────────────────────────────────────────
+    lines += section("RAW SLITHER ONLY   (pre-debate, MEDIUM+ findings)")
+    lines += metrics_block(total_tp_slither, total_fp_slither, total_fn_slither, metrics_slither)
+
+    # ── Debate-confirmed: LLM-only ────────────────────────────────────────────
+    lines += section("DEBATE — LLM CONFIRMED  (post-debate, LLM/BOTH source)")
+    lines += metrics_block(total_tp_llm, total_fp_llm, total_fn_llm, metrics_llm)
+
+    # ── Debate-confirmed: both engines ────────────────────────────────────────
+    lines += section("DEBATE — BOTH ENGINES   (post-debate, LLM + Slither)")
+    lines += metrics_block(total_tp_both, total_fp_both, total_fn_both, metrics_both)
+
+    # ── Impact of debate on LLM findings ─────────────────────────────────────
+    lines += section("DEBATE IMPACT — LLM findings: raw detect vs post-debate")
+    lines.append("  Does the debate pipeline improve on raw detector output?")
     lines.append("")
-    lines.append(row("Precision:", f"{metrics_both['precision']:.1%}"))
-    lines.append(row("Recall:", f"{metrics_both['recall']:.1%}"))
-    lines.append(row("F1-Score:", f"{metrics_both['f1_score']:.4f}"))
+    lines += delta_block("Detector (raw)", metrics_detect, "Debate-LLM", metrics_llm)
 
-    lines += section("OVERALL METRICS — LLM-ONLY")
-    lines.append(row("True Positives (TP):", total_tp_llm))
-    lines.append(row("False Positives (FP):", total_fp_llm))
-    lines.append(row("False Negatives (FN):", total_fn_llm))
+    # ── Impact of adding Slither ──────────────────────────────────────────────
+    lines += section("SLITHER IMPACT — debate-LLM vs debate-both")
+    lines.append("  Does adding Slither confirmed findings improve on LLM-only debate?")
     lines.append("")
-    lines.append(row("Precision:", f"{metrics_llm['precision']:.1%}"))
-    lines.append(row("Recall:", f"{metrics_llm['recall']:.1%}"))
-    lines.append(row("F1-Score:", f"{metrics_llm['f1_score']:.4f}"))
+    lines += delta_block("Debate-LLM", metrics_llm, "Debate-Both", metrics_both)
 
-    # Improvement 
-    lines += section("IMPROVEMENT — BOTH vs LLM-ONLY")
-    p_delta  = metrics_both["precision"] - metrics_llm["precision"]
-    r_delta  = metrics_both["recall"]    - metrics_llm["recall"]
-    f1_delta = metrics_both["f1_score"]  - metrics_llm["f1_score"]
-    lines.append(row("Precision delta:", f"{p_delta:+.1%}"))
-    lines.append(row("Recall delta:", f"{r_delta:+.1%}"))
-    lines.append(row("F1-Score delta:", f"{f1_delta:+.4f}"))
-    if total_tp_llm > 0:
-        tp_delta = ((total_tp_both - total_tp_llm) / total_tp_llm) * 100
-        lines.append(row("TP improvement:", f"{tp_delta:+.1f}%"))
-
-    # Interpretation 
-    lines += section("INTERPRETATION")
-    b_p = metrics_both["precision"]
-    b_r = metrics_both["recall"]
-    b_f = metrics_both["f1_score"]
-    l_p = metrics_llm["precision"]
-    l_r = metrics_llm["recall"]
-    l_f = metrics_llm["f1_score"]
-
-    if b_f >= 0.7:
-        quality = "strong"
-    elif b_f >= 0.5:
-        quality = "moderate"
-    elif b_f >= 0.3:
-        quality = "weak"
-    else:
-        quality = "poor"
-
-    lines.append(
-        f"  The combined (LLM + Slither) engine achieves {quality} overall performance"
-    )
-    lines.append(
-        f"  with an F1-score of {b_f:.3f} (Precision {b_p:.1%}, Recall {b_r:.1%})."
-    )
-    lines.append("")
-
-    if b_r > b_p:
+    # ── Summary comparison table ──────────────────────────────────────────────
+    lines += section("SUMMARY COMPARISON")
+    lines.append(f"  {'Mode':<32} {'Precision':>9} {'Recall':>7} {'F1':>7}")
+    lines.append("  " + "-" * (W - 2))
+    for label, m in [
+        ("Detector raw (pre-debate)",    metrics_detect),
+        ("Slither raw  (pre-debate)",    metrics_slither),
+        ("Debate — LLM confirmed",       metrics_llm),
+        ("Debate — Both engines",        metrics_both),
+    ]:
         lines.append(
-            f"  Recall ({b_r:.1%}) outpaces Precision ({b_p:.1%}), meaning the system"
-        )
-        lines.append(
-            "  catches most real vulnerabilities but also flags some false positives."
-        )
-    elif b_p > b_r:
-        lines.append(
-            f"  Precision ({b_p:.1%}) outpaces Recall ({b_r:.1%}), meaning confirmed"
-        )
-        lines.append(
-            "  findings are reliable but some real vulnerabilities are missed."
-        )
-    else:
-        lines.append("  Precision and Recall are well balanced.")
-    lines.append("")
-
-    if f1_delta > 0.05:
-        lines.append(
-            f"  Adding Slither improves F1 by {f1_delta:+.4f} over LLM-only, indicating"
-        )
-        lines.append("  the static analyser contributes meaningfully to detection coverage.")
-    elif f1_delta < -0.05:
-        lines.append(
-            "  Slither introduces more false positives than true positives in this run."
-        )
-    else:
-        lines.append(
-            "  Slither has minimal net impact on F1 — most detections come from the LLM."
+            f"  {label:<32} {m['precision']:>8.1%} {m['recall']:>6.1%} {m['f1_score']:>6.3f}"
         )
 
-    # breakdown per ctegory 
-    lines += section("PER-VULNERABILITY BREAKDOWN — BOTH ENGINES")
-    lines += cat_table(per_cat_both, "both")
+    # ── Per-category breakdowns ───────────────────────────────────────────────
+    lines += section("PER-VULNERABILITY — DETECTOR RAW")
+    lines += cat_table(per_cat_detect)
 
-    lines += section("PER-VULNERABILITY BREAKDOWN — LLM-ONLY")
-    lines += cat_table(per_cat_llm, "llm")
+    lines += section("PER-VULNERABILITY — SLITHER RAW")
+    lines += cat_table(per_cat_slither)
+
+    lines += section("PER-VULNERABILITY — DEBATE LLM")
+    lines += cat_table(per_cat_llm)
+
+    lines += section("PER-VULNERABILITY — DEBATE BOTH ENGINES")
+    lines += cat_table(per_cat_both)
 
     lines.append("")
     lines.append("=" * W)
     lines.append("  END OF REPORT")
     lines.append("=" * W)
 
-    report_text = "\n".join(lines)
-    report_path.write_text(report_text)
+    report_path.write_text("\n".join(lines))
     return report_path
 
 
@@ -663,43 +661,32 @@ def preflight_check() -> bool:
     print("\u2502  PRE-FLIGHT CHECK                                       \u2502")
     print("\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518")
 
-    # 1. Dataset folder
     if DATASET_PATH.exists():
         sol_count = len(list(DATASET_PATH.rglob("*.sol")))
-        print(f"  OK  Dataset folder found  ({sol_count} .sol files)")
-        print(f"      {DATASET_PATH}")
+        print(f"  OK  Dataset found  ({sol_count} .sol files)  {DATASET_PATH}")
     else:
-        print(f"  FAIL  Dataset folder NOT found")
-        print(f"        Expected: {DATASET_PATH}")
+        print(f"  FAIL  Dataset NOT found — expected: {DATASET_PATH}")
         ok = False
 
-    # 2. Ground-truth file
     if GT_FILE.exists():
         print(f"  OK  Ground-truth file found  -> {GT_FILE.name}")
     else:
-        print(f"  FAIL  Ground-truth file NOT found")
-        print(f"        Expected: {GT_FILE}")
+        print(f"  FAIL  Ground-truth NOT found — expected: {GT_FILE}")
         ok = False
 
-    # 3. GROQ_API_KEY
     if os.getenv("GROQ_API_KEY"):
         print(f"  OK  GROQ_API_KEY is set")
     else:
-        print(f"  WARN  GROQ_API_KEY not set -- backend will fail on every LLM call")
-        print(f"        Fix: export GROQ_API_KEY=gsk_...")
+        print(f"  WARN  GROQ_API_KEY not set — backend LLM calls will fail")
 
-    # 4. Langfuse:checks SDK installed, Keys present and if prompt is reachable
     langfuse_installed = importlib.util.find_spec("langfuse") is not None
     lf_pub = bool(os.getenv("LANGFUSE_PUBLIC_KEY"))
     lf_sec = bool(os.getenv("LANGFUSE_SECRET_KEY"))
 
     if not langfuse_installed:
-        print(f"  --  Langfuse SDK not installed")
-        print(f"      -> prompts will be read from local .txt files (no tracing)")
-        print(f"         Install with: pip install langfuse")
+        print(f"  --  Langfuse not installed — prompts read from local .txt files")
     elif not lf_pub or not lf_sec:
-        print(f"  --  Langfuse SDK installed but keys not set (LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)")
-        print(f"      -> prompts will be read from local .txt files (no tracing)")
+        print(f"  --  Langfuse keys not set — prompts read from local .txt files")
     else:
         try:
             from langfuse import Langfuse
@@ -708,25 +695,20 @@ def preflight_check() -> bool:
                 secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
                 host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
             )
-            prompt_obj = client.get_prompt("audit-system-prompt", label="production")
-            text = prompt_obj.compile()
-            preview = text[:70].replace("\n", " ")
-            print(f"  OK  Langfuse connected -- prompt 'audit-system-prompt' loaded OK")
-            print(f"      Preview: \"{preview}...\"")
-            print(f"      All audit traces will appear in your Langfuse dashboard")
+            prompt_obj = client.get_prompt("audit-detect-prompt", label="production")
+            preview = prompt_obj.compile()[:70].replace("\n", " ")
+            print(f"  OK  Langfuse connected — audit-detect-prompt loaded  \"{preview}...\"")
         except Exception as exc:
-            print(f"  WARN  Langfuse keys set but fetch failed: {exc}")
-            print(f"        -> prompts will be read from local .txt files as fallback")
+            print(f"  WARN  Langfuse keys set but fetch failed: {exc} — falling back to local files")
 
     print()
     return ok
 
-# Main 
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def test_batch():
     print("╔════════════════════════════════════════════════════════╗")
-    print("║     SmartBugs Evaluation (Batch Mode)                  ║")
-    print("║     (Both Engines vs LLM-Only)                         ║")
+    print("║     SmartBugs Evaluation                               ║")
     print("╚════════════════════════════════════════════════════════╝\n")
 
     if not preflight_check():
@@ -740,17 +722,20 @@ async def test_batch():
     print(f"✓ {len(contracts)} contracts selected")
     print(f"✓ Delay between contracts: {DELAY_BETWEEN_CONTRACTS}s\n")
 
-    total_tp_both = total_fp_both = total_fn_both = 0
-    total_tp_llm  = total_fp_llm  = total_fn_llm  = 0
+    # running totals for each of the four scoring modes
+    total_tp_both    = total_fp_both    = total_fn_both    = 0
+    total_tp_llm     = total_fp_llm     = total_fn_llm     = 0
+    total_tp_detect  = total_fp_detect  = total_fn_detect  = 0
+    total_tp_slither = total_fp_slither = total_fn_slither = 0
     skipped = 0
     failed  = 0
-    # accumulators per category
-    per_cat_both: Dict = {}
-    per_cat_llm:  Dict = {}
+    per_cat_both:    Dict = {}
+    per_cat_llm:     Dict = {}
+    per_cat_detect:  Dict = {}
+    per_cat_slither: Dict = {}
 
     for i, (contract_name, file_path) in enumerate(contracts, 1):
-        # Rate-limit: wait before every call except the first
-        if i > 1:
+        if i > 1:  # wait between contracts to respect KEY1 TPM window
             await asyncio.sleep(DELAY_BETWEEN_CONTRACTS)
 
         print(f"[{i:3}/{len(contracts)}] {contract_name}...", end=" ", flush=True)
@@ -769,46 +754,48 @@ async def test_batch():
             failed += 1
             continue
 
-        vulns_detected = audit_result.get("vulnerabilities", [])
-        llm_count = len([v for v in vulns_detected if v.get("source") in ("LLM", "BOTH")])
+        vulns_detected  = audit_result.get("vulnerabilities", [])
+        raw_detect      = audit_result.get("raw_detect", [])
+        raw_slither     = audit_result.get("raw_slither", [])
+        llm_count       = len([v for v in vulns_detected if v.get("source") in ("LLM", "BOTH")])
 
-        both_metrics, llm_metrics = compare_findings(vulns_detected, vulns_gt)
+        debate_both, debate_llm, detect_m, slither_m = compare_findings(
+            vulns_detected, raw_detect, raw_slither, vulns_gt
+        )
 
-        total_tp_both += both_metrics["tp"]
-        total_fp_both += both_metrics["fp"]
-        total_fn_both += both_metrics["fn"]
-        total_tp_llm  += llm_metrics["tp"]
-        total_fp_llm  += llm_metrics["fp"]
-        total_fn_llm  += llm_metrics["fn"]
+        total_tp_both    += debate_both["tp"];  total_fp_both    += debate_both["fp"];  total_fn_both    += debate_both["fn"]
+        total_tp_llm     += debate_llm["tp"];   total_fp_llm     += debate_llm["fp"];   total_fn_llm     += debate_llm["fn"]
+        total_tp_detect  += detect_m["tp"];     total_fp_detect  += detect_m["fp"];     total_fn_detect  += detect_m["fn"]
+        total_tp_slither += slither_m["tp"];    total_fp_slither += slither_m["fp"];    total_fn_slither += slither_m["fn"]
 
-        for cat, vals in both_metrics.get("per_category", {}).items():
-            per_cat_both.setdefault(cat, {"tp": 0, "fp": 0, "fn": 0})
-            per_cat_both[cat]["tp"] += vals.get("tp", 0)
-            per_cat_both[cat]["fp"] += vals.get("fp", 0)
-            per_cat_both[cat]["fn"] += vals.get("fn", 0)
-        for cat, vals in llm_metrics.get("per_category", {}).items():
-            per_cat_llm.setdefault(cat, {"tp": 0, "fp": 0, "fn": 0})
-            per_cat_llm[cat]["tp"] += vals.get("tp", 0)
-            per_cat_llm[cat]["fp"] += vals.get("fp", 0)
-            per_cat_llm[cat]["fn"] += vals.get("fn", 0)
+        def _acc(store, metrics):
+            for cat, vals in metrics.get("per_category", {}).items():
+                store.setdefault(cat, {"tp": 0, "fp": 0, "fn": 0})
+                store[cat]["tp"] += vals.get("tp", 0)
+                store[cat]["fp"] += vals.get("fp", 0)
+                store[cat]["fn"] += vals.get("fn", 0)
+
+        _acc(per_cat_both,    debate_both)
+        _acc(per_cat_llm,     debate_llm)
+        _acc(per_cat_detect,  detect_m)
+        _acc(per_cat_slither, slither_m)
 
         print(
-            f"✓  GT:{len(vulns_gt)} | Det:{len(vulns_detected)} (LLM:{llm_count}) | "
-            f"Both TP:{both_metrics['tp']} FP:{both_metrics['fp']} FN:{both_metrics['fn']} | "
-            f"LLM TP:{llm_metrics['tp']} FP:{llm_metrics['fp']} FN:{llm_metrics['fn']}"
+            f"✓  GT:{len(vulns_gt)} | "
+            f"Det(raw):{len(raw_detect)} Sli(raw):{len(raw_slither)} | "
+            f"Debate LLM:{llm_count} | "
+            f"TP det:{detect_m['tp']} sli:{slither_m['tp']} "
+            f"deb-both:{debate_both['tp']} deb-llm:{debate_llm['tp']}"
         )
 
         if VERBOSE:
             from collections import Counter
 
-        
             print(f"    File:    {file_path}")
 
-            #  Ground truth 
             gt_parts = [f"{v.get('category','?')}@{v.get('lines',[])}" for v in vulns_gt]
             print(f"    GT:      {', '.join(gt_parts)}")
 
-            # LLM findings with 
             llm_findings_v = [v for v in vulns_detected if v.get("source") in ("LLM", "BOTH")]
             if llm_findings_v:
                 llm_parts = []
@@ -831,7 +818,6 @@ async def test_batch():
             else:
                 print(f"    LLM:     NONE — LLM failed or returned empty")
 
-            # Slither: just category counts 
             sli_counts = Counter(
                 normalize_category(v.get("category", "?"))
                 for v in vulns_detected if v.get("source") == "SLITHER"
@@ -843,38 +829,33 @@ async def test_batch():
             print(f"    Slither: {sli_str}")
             print()
 
-    # Summary 
-    evaluated = len(contracts) - skipped - failed
-    metrics_both = calculate_metrics(total_tp_both, total_fp_both, total_fn_both)
-    metrics_llm  = calculate_metrics(total_tp_llm,  total_fp_llm,  total_fn_llm)
+    # Summary
+    evaluated        = len(contracts) - skipped - failed
+    metrics_both     = calculate_metrics(total_tp_both,    total_fp_both,    total_fn_both)
+    metrics_llm      = calculate_metrics(total_tp_llm,     total_fp_llm,     total_fn_llm)
+    metrics_detect   = calculate_metrics(total_tp_detect,  total_fp_detect,  total_fn_detect)
+    metrics_slither  = calculate_metrics(total_tp_slither, total_fp_slither, total_fn_slither)
+
+    def _print_mode(label, tp, fp, fn, m):
+        print(f" {label}:")
+        print(f"  TP: {tp} | FP: {fp} | FN: {fn}")
+        print(f"  Precision: {m['precision']:.1%}  Recall: {m['recall']:.1%}  F1: {m['f1_score']:.4f}\n")
 
     print(f"\n{'='*70}")
-    print(f" FINAL RESULTS  ({evaluated} contracts evaluated, "
-          f"{skipped} skipped, {failed} failed)")
+    print(f" FINAL RESULTS  ({evaluated} contracts evaluated, {skipped} skipped, {failed} failed)")
     print(f"{'='*70}\n")
+    _print_mode("DETECTOR ONLY (raw, pre-debate)",  total_tp_detect,  total_fp_detect,  total_fn_detect,  metrics_detect)
+    _print_mode("SLITHER ONLY  (raw MEDIUM+, pre-debate)", total_tp_slither, total_fp_slither, total_fn_slither, metrics_slither)
+    _print_mode("DEBATE — LLM only (post-debate)",  total_tp_llm,     total_fp_llm,     total_fn_llm,     metrics_llm)
+    _print_mode("DEBATE — BOTH engines (post-debate)", total_tp_both, total_fp_both,    total_fn_both,    metrics_both)
 
-    print(" BOTH MODE (LLM + Slither):")
-    print(f"  TP: {total_tp_both} | FP: {total_fp_both} | FN: {total_fn_both}")
-    print(f"  Precision: {metrics_both['precision']:.1%}")
-    print(f"  Recall:    {metrics_both['recall']:.1%}")
-    print(f"  F1-Score:  {metrics_both['f1_score']:.4f}\n")
-
-    print("LLM-ONLY MODE:")
-    print(f"  TP: {total_tp_llm} | FP: {total_fp_llm} | FN: {total_fn_llm}")
-    print(f"  Precision: {metrics_llm['precision']:.1%}")
-    print(f"  Recall:    {metrics_llm['recall']:.1%}")
-    print(f"  F1-Score:  {metrics_llm['f1_score']:.4f}\n")
-
-    print(" IMPROVEMENT (Both vs LLM-Only):")
-    if total_tp_llm > 0:
-        tp_delta = ((total_tp_both - total_tp_llm) / total_tp_llm) * 100
-        print(f"  TP:        {tp_delta:+.1f}%")
-    p_delta  = metrics_both['precision'] - metrics_llm['precision']
-    r_delta  = metrics_both['recall']    - metrics_llm['recall']
-    f1_delta = metrics_both['f1_score']  - metrics_llm['f1_score']
-    print(f"  Precision: {p_delta:+.1%}")
-    print(f"  Recall:    {r_delta:+.1%}")
-    print(f"  F1-Score:  {f1_delta:+.4f}")
+    print(" DEBATE vs DETECTOR (does debate help LLM findings?):")
+    for label, a, b in [
+        ("Precision", metrics_llm['precision'] - metrics_detect['precision'], metrics_both['precision'] - metrics_detect['precision']),
+        ("Recall",    metrics_llm['recall']    - metrics_detect['recall'],    metrics_both['recall']    - metrics_detect['recall']),
+        ("F1",        metrics_llm['f1_score']  - metrics_detect['f1_score'],  metrics_both['f1_score']  - metrics_detect['f1_score']),
+    ]:
+        print(f"  {label:<10} debate-LLM: {a:+.1%}   debate-both: {b:+.1%}")
 
     # Save report
     report_path = generate_report(
@@ -882,16 +863,14 @@ async def test_batch():
         skipped=skipped,
         failed=failed,
         total_contracts=len(contracts),
-        total_tp_both=total_tp_both,
-        total_fp_both=total_fp_both,
-        total_fn_both=total_fn_both,
-        total_tp_llm=total_tp_llm,
-        total_fp_llm=total_fp_llm,
-        total_fn_llm=total_fn_llm,
-        metrics_both=metrics_both,
-        metrics_llm=metrics_llm,
-        per_cat_both=per_cat_both,
-        per_cat_llm=per_cat_llm,
+        total_tp_both=total_tp_both,       total_fp_both=total_fp_both,       total_fn_both=total_fn_both,
+        total_tp_llm=total_tp_llm,         total_fp_llm=total_fp_llm,         total_fn_llm=total_fn_llm,
+        total_tp_detect=total_tp_detect,   total_fp_detect=total_fp_detect,   total_fn_detect=total_fn_detect,
+        total_tp_slither=total_tp_slither, total_fp_slither=total_fp_slither, total_fn_slither=total_fn_slither,
+        metrics_both=metrics_both,         metrics_llm=metrics_llm,
+        metrics_detect=metrics_detect,     metrics_slither=metrics_slither,
+        per_cat_both=per_cat_both,         per_cat_llm=per_cat_llm,
+        per_cat_detect=per_cat_detect,     per_cat_slither=per_cat_slither,
     )
     print(f"\n Report saved to: {report_path}")
 

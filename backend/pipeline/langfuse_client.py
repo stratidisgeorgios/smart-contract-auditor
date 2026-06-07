@@ -1,10 +1,11 @@
 """
-This script is a helper script for the Langfuse client.
+Langfuse client helper.
 
-It provides:
-  - get_prompt() -> fetch a prompt by name from Langfuse, with a local file fallback
-  - get_callback() -> returns a LangChain CallbackHandler for tracing 
-  - flush()-> flush pending Langfuse events before the process exits
+Provides:
+  - get_prompt()     → fetch a prompt by name from Langfuse, with a local file fallback
+  - get_prompt_obj() → return the raw Langfuse prompt object (used to link generations to Prompt Metrics)
+  - get_callback()   → return a LangChain CallbackHandler for tracing
+  - flush()          → flush pending Langfuse events before the process exits
 """
 
 import logging
@@ -14,26 +15,25 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-#Local fallback paths 
-# If Langfuse is unavailable we fall back to these files.
+_BASE = Path(__file__).parent.parent / "data" / "instructions"
 
+# Local fallback paths — used when Langfuse is unavailable or keys are not set.
 _FALLBACK_PATHS: dict[str, Path] = {
-    "audit-system-prompt": (
-        Path(__file__).parent.parent / "data" / "instructions" / "prompt_v3_smartbugs.txt"
-    ),
-    "reflection-system-prompt": (
-        Path(__file__).parent.parent / "data" / "instructions" / "reflection_prompt.txt"
-    ),
+    "audit-detect-prompt":      _BASE / "detection_prompt.txt",
+    "audit-critique-prompt":    _BASE / "critique_prompt.txt",
+    "audit-verify-prompt":      _BASE / "verify_prompt.txt",
+    "audit-tiebreaker-prompt":  _BASE / "tiebreaker_prompt.txt",
 }
 
 # Lazy Langfuse client
-_client = None       
-_initialised = False # guard to avoid repeated init attempts
+_client = None
+_initialised = False   # guard to avoid repeated init attempts
 
 
 def _get_client():
     """
-    Lazily initialise the Langfuse client. Returns the client if everything is configured, or None if Langfuse is
+    Lazily initialise the Langfuse client.
+    Returns the client if everything is configured, or None if Langfuse is
     disabled or the SDK is not installed.
     """
     global _client, _initialised
@@ -56,7 +56,7 @@ def _get_client():
         return None
 
     try:
-        from langfuse import Langfuse 
+        from langfuse import Langfuse
         _client = Langfuse(
             public_key=public_key,
             secret_key=secret_key,
@@ -75,12 +75,10 @@ def _get_client():
         return None
 
 
-# Public API
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def get_prompt(name: str, label: str = "production") -> str:
-    """
-    Fetch a prompt text by name.
-    """
+    """Fetch prompt text by name. Falls back to local file if Langfuse is unavailable."""
     client = _get_client()
 
     if client is not None:
@@ -98,14 +96,11 @@ def get_prompt(name: str, label: str = "production") -> str:
             )
             return text
         except Exception as exc:
-            logger.warning("[Langfuse] Fetch failed for '%s': %s", name, exc)
-            logger.warning("[Langfuse] -> falling back to local .txt file")
+            logger.warning("[Langfuse] Fetch failed for '%s': %s — falling back to local file", name, exc)
 
-    # Fallback: read from disk
     text = _local_prompt(name)
     logger.info(
-        "[Langfuse] PROMPT SOURCE: LOCAL FILE  (name='%s', %d chars)"
-        "  -- set LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY to use Langfuse",
+        "[Langfuse] PROMPT SOURCE: LOCAL FILE  (name='%s', %d chars)",
         name, len(text),
     )
     return text
@@ -113,7 +108,9 @@ def get_prompt(name: str, label: str = "production") -> str:
 
 def get_prompt_obj(name: str, label: str = "production"):
     """
-    Return the raw Langfuse prompt object (not just the text). Used by llm_node to pass prompt= to get_callback(), which links the LLM generation to the prompt in Langfuse Prompt Metrics.
+    Return the raw Langfuse prompt object (not just the text).
+    Used to link LLM generations to the prompt in Langfuse Prompt Metrics.
+    Returns None if Langfuse is unavailable.
     """
     client = _get_client()
     if client is None:
@@ -126,7 +123,7 @@ def get_prompt_obj(name: str, label: str = "production"):
 
 
 def _local_prompt(name: str) -> str:
-    """Read the prompt from the local fallback file."""
+    """Read the prompt text from the registered local fallback file."""
     path = _FALLBACK_PATHS.get(name)
     if path is None:
         raise FileNotFoundError(
@@ -145,51 +142,40 @@ def get_callback(
     trace_name: str,
     contract_name: str = "",
     metadata: Optional[dict] = None,
-    prompt_name: str = "audit-system-prompt",
-    prompt_label: str = "production",
 ):
     """
-    Return a LangChain CallbackHandler that sends tracing data to Langfuse and links the generation to the prompt so it appears in Prompt Metrics. The prompt linkage is done by fetching the prompt object and attaching it
-    to the handler 
+    Return a LangChain CallbackHandler that sends tracing data to Langfuse
+    and links the generation to the prompt so it appears in Prompt Metrics.
+    Returns None if Langfuse is unavailable.
     """
     client = _get_client()
     if client is None:
         return None
 
     try:
-        from langfuse.callback import CallbackHandler 
-
-        # Fetch the prompt object so generations are linked to it in the UI
-        prompt_obj = None
         try:
-            prompt_obj = client.get_prompt(
-                prompt_name,
-                label=prompt_label,
-                cache_ttl_seconds=300,
+            from langfuse.langchain import CallbackHandler  # Langfuse v4
+        except ImportError:
+            from langfuse.callback import CallbackHandler   # Langfuse v2/v3
+
+        # Try v2/v3 constructor (full args) → v4 minimal → bare
+        try:
+            handler = CallbackHandler(
+                trace_name=trace_name,
+                user_id=contract_name or "unknown",
+                metadata=metadata or {},
+                stateful_client=client,
             )
-        except Exception as exc:
-            logger.warning("[Langfuse] Could not fetch prompt for linking: %s", exc)
-
-        handler = CallbackHandler(
-            trace_name=trace_name,
-            user_id=contract_name or "unknown",
-            metadata=metadata or {},
-            stateful_client=client,
-        )
-
-        # Link the prompt to this trace so it appears in Prompt -> Metrics
-        if prompt_obj is not None:
+        except TypeError:
             try:
-                handler.langfuse.trace(
-                    name=trace_name,
-                    metadata={**(metadata or {}), "prompt_name": prompt_name},
-                )
-            except Exception:
-                pass # linking is best-effort, never break the audit
+                handler = CallbackHandler(session_id=trace_name)
+            except TypeError:
+                handler = CallbackHandler()
 
+        logger.info("[Langfuse] Callback handler created for '%s'", trace_name)
         return handler
     except ImportError:
-        logger.warning("[Langfuse] langfuse[callback] not installed")
+        logger.warning("[Langfuse] LangChain callback not available in this Langfuse version")
         return None
     except Exception as exc:
         logger.warning("[Langfuse] Could not create callback: %s", exc)
@@ -197,9 +183,7 @@ def get_callback(
 
 
 def flush():
-    """
-    Flush any buffered Langfuse events.
-    """
+    """Flush any buffered Langfuse events before the process exits."""
     client = _get_client()
     if client is not None:
         try:

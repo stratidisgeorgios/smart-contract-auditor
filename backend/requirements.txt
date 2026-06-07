@@ -9,4 +9,5 @@ slither-analyzer>=0.10.0
 solc-select>=0.2.1
 python-dotenv>=1.0.0
 aiohttp>=3.9.0
-langfuse
+requests>=2.31.0
+langfuse[callback]

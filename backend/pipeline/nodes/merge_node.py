@@ -16,12 +16,11 @@ import logging
 from datetime import datetime, timezone
 
 from pipeline.state import AuditState
-
 logger = logging.getLogger(__name__)
 
 SEVERITY_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1} # Numeric index for each severity level, used for sorting and comparison. A higher number means more severity.
 
-_DEFAULT_LLM_MODEL = "llama-3.1-8b-instant" # Default model name used in the report metadata if the LLM didn't report which model it used
+_DEFAULT_LLM_MODEL = "llama-3.1-8b-instant"
 
 
 def _overall_risk(vulns: list[dict]) -> str:
@@ -140,44 +139,55 @@ def _dedup_slither(vulns: list[dict]) -> list[dict]:
 
 
 def run_merge_node(state: AuditState) -> AuditState:
-    """LangGraph node that merges LLM and Slither findings and builds the final report."""
+    """
+    Builds the final report exclusively from confirmed_findings — findings that
+    passed the debate pipeline (critique → verify → tiebreaker).
+
+    Anything the debate rejected or never confirmed is dropped.
+    Overlapping LLM + Slither confirmed findings are tagged as BOTH.
+    """
     logger.info("[LOG] Merge node")
     errors = list(state.get("errors", []))
 
-    # Extract vulnerability lists from previous nodes 
-    llm_analysis = (state.get("llm_report") or {}).get("llm_analysis", {})
-    llm_vulns = llm_analysis.get("vulnerabilities", [])
-    slither_vulns_raw = (state.get("slither_report") or {}).get("vulnerabilities", [])
+    all_confirmed = state.get("confirmed_findings", [])
 
+    # Split into LLM-origin and Slither-origin confirmed findings
+    confirmed_llm = [f for f in all_confirmed if not f.get("id", "").startswith("SLI-")]
+    confirmed_sli = _dedup_slither([f for f in all_confirmed if f.get("id", "").startswith("SLI-")])
 
-    slither_vulns = _dedup_slither(slither_vulns_raw)
+    merged: list[dict] = []
+    sli_used: set[int] = set()
 
-    merged: list[dict] = []  
-    slither_used: set[int] = set() # track which Slither findings have already been merged
-
-     # Step 1: Match each LLM finding against Slither findings
-    for llm_v in llm_vulns:
+    # Step 1: For each confirmed LLM finding, check if a confirmed Slither finding
+    # covers the same vulnerability — if so merge them into a BOTH-source finding.
+    for llm_v in confirmed_llm:
         llm_v = {**llm_v, "source": "LLM"}
-
         if "line_numbers" not in llm_v:
             llm_v["line_numbers"] = []
 
         matched = False
-        for i, sli_v in enumerate(slither_vulns):
-            if i not in slither_used and _are_same(llm_v, sli_v):
+        for i, sli_v in enumerate(confirmed_sli):
+            if i not in sli_used and _are_same(llm_v, sli_v):
                 merged.append(_merge(llm_v, sli_v))
-                slither_used.add(i)
+                sli_used.add(i)
                 matched = True
                 break
         if not matched:
             merged.append(llm_v)
 
-    # Step 2: Append findings found only by Slither
-    for i, sli_v in enumerate(slither_vulns):
-        if i not in slither_used:
+    # Step 2: Add Slither-confirmed findings that have no LLM counterpart
+    for i, sli_v in enumerate(confirmed_sli):
+        if i not in sli_used:
             merged.append({**sli_v, "source": "SLITHER"})
 
-    # Step 3: Sort by severity
+    # Step 3: Stamp confidence from debate scores, sort by severity
+    for v in merged:
+        score = v.get("critique_score") or v.get("verify_score")
+        if score is not None:
+            v["confidence"] = "HIGH" if score >= 0.7 else "MEDIUM"
+        elif "confidence" not in v:
+            v["confidence"] = "HIGH"  # tiebreaker-confirmed findings
+
     merged.sort(
         key=lambda v: SEVERITY_RANK.get(v.get("severity", "INFO"), 1),
         reverse=True,
@@ -203,20 +213,29 @@ def run_merge_node(state: AuditState) -> AuditState:
             "contract_name":    state["contract_name"],
             "audit_timestamp":  datetime.now(timezone.utc).isoformat(),
             "started_at":       state.get("started_at", ""),
-            "llm_model":        llm_analysis.get("model_used", _DEFAULT_LLM_MODEL),
+            "llm_model":        _DEFAULT_LLM_MODEL,
             "slither_available": (state.get("slither_report") or {}).get("success", False),
             "pipeline_errors":  errors,
         },
         "overall_risk":  _overall_risk(merged),
-        "summary":       llm_analysis.get("summary", "Audit completed."),
+        "summary":       "Audit completed.",
         "contract_info": {
-
-            "solidity_version": llm_analysis.get("contract_info", {}).get("solidity_version", ""),
-            "contract_names":   llm_analysis.get("contract_info", {}).get("contract_names", []),
-            "total_lines":      llm_analysis.get("contract_info", {}).get("total_lines", 0),
+            "solidity_version": (state.get("contract_info") or {}).get("solidity_version", ""),
+            "contract_names":   (state.get("contract_info") or {}).get("contract_names", []),
+            "total_lines":      (state.get("contract_info") or {}).get("total_lines", 0),
         },
         "statistics":       stats,
         "vulnerabilities":  merged,
+        "raw_detect":       [
+            {**f, "source": "LLM"}
+            for f in state.get("llm_detection_findings", [])
+        ],
+        "raw_slither":      [
+            {**f, "source": "SLITHER"}
+            for f in (state.get("slither_report") or {}).get("vulnerabilities", [])
+            if f.get("severity", "").upper() not in {"INFO", "OPTIMIZATION", "LOW"}
+            and f.get("category", "").lower() not in {"informational", "optimization"}
+        ],
     }
 
     # Final report —> debug only
