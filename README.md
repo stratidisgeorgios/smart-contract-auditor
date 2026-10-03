@@ -1,8 +1,19 @@
-# Smart Contract Auditor — Project Overview
+# Smart Contract Auditor: Multi-Agent LLM + Static Analysis Pipeline
 
 A web app that lets you upload a Solidity smart contract and get back a detailed security report.
 It combines two detection engines (an LLM via Groq and Slither static analysis) with a
 three-agent debate pipeline that validates every finding before it reaches the report.
+
+## Branches
+
+This repository contains two versions of the auditor:
+
+| Branch | Approach |
+|---|---|
+| [`main`](../../tree/main) | **Single-agent baseline.** One LLM call plus Slither, merged and deduplicated. |
+| [`agentic-implementation`](../../tree/agentic-implementation) | **Multi-agent debate (this branch).** A detector agent proposes findings, a skeptic agent and a defender agent score each one independently, and a tiebreaker agent decides the cases they disagree on. |
+
+Both versions share the same Next.js frontend and Slither integration.
 
 ---
 
@@ -85,8 +96,9 @@ contract code, raw findings from each engine, debate scores, confirmed findings,
 Sends the full contract to the **Groq API** with a high-recall prompt — the goal is to find
 everything, since a later stage filters false positives.
 
-- **Small contracts** (≤200 lines): `llama-3.1-8b-instant` (6K TPM)
-- **Large contracts** (>200 lines): `meta-llama/llama-4-scout-17b-16e-instruct` (30K TPM)
+- Model: `openai/gpt-oss-120b` for all contract sizes (`LLM_MODEL_SMALL` / `LLM_MODEL_LARGE` in `llm_node.py`).
+  `openai/gpt-oss-20b` is not used because it exhausts the 4096-token output limit on reasoning
+  and returns an empty response.
 - Uses `GROQ_API_KEY`
 - System prompt fetched from Langfuse (`audit-detect-prompt`), falls back to `data/instructions/detection_prompt.txt`
 
@@ -119,7 +131,7 @@ Results go into `state["slither_report"]`.
 Takes all LLM findings plus MEDIUM+ Slither findings (capped at 15 by severity priority).
 Scores every finding independently against the relevant contract code excerpt.
 
-- Model: `llama-4-scout-17b` via `GROQ_API_KEY_2`
+- Model: `openai/gpt-oss-120b` via `GROQ_API_KEY_2`
 - Prompt: `audit-critique-prompt` (Langfuse)
 - Attaches `critique_score` (0–1) and `critique_verdict` to each finding
 - Makes no pass/fail decisions — only scores
@@ -133,7 +145,7 @@ Results go into `state["all_findings_to_review"]`.
 Receives the same finding list as critique but **never sees critique's scores** — this
 ensures an independent assessment.
 
-- Model: `llama-4-scout-17b` via `GROQ_API_KEY_3`
+- Model: `openai/gpt-oss-120b` via `GROQ_API_KEY_3`
 - Prompt: `audit-verify-prompt` (Langfuse)
 - Compares its own scores against critique's after scoring:
   - Both agents ≥ confirm threshold → `confirmed_findings` (auto-confirmed)
@@ -147,7 +159,7 @@ Receives `uncertain_findings` with both agents' full scores and reasoning attach
 Makes a final binary confirmed/rejected decision on each. Waits up to 65s before
 calling to let the detect node's TPM window clear (both share `GROQ_API_KEY`).
 
-- Model: `llama-4-scout-17b` via `GROQ_API_KEY`
+- Model: `openai/gpt-oss-120b` via `GROQ_API_KEY`
 - Prompt: `audit-tiebreaker-prompt` (Langfuse)
 
 Confirmed findings are appended to `confirmed_findings`.
@@ -231,13 +243,42 @@ Uses a lightweight inline Solidity tokeniser (no external library).
 
 ---
 
+## Running locally
+
+Prerequisites: Python 3.11+, Node.js 18+, and a free [Groq API key](https://console.groq.com/keys).
+
+**Backend**
+```bash
+cd backend/
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env          # then fill in your Groq key(s)
+uvicorn main:app --port 8000
+```
+Slither and `solc-select` are installed by `requirements.txt`. Keep the venv activated so they are
+on your `PATH`; the Slither node calls them as subprocesses.
+
+**Frontend**
+```bash
+cd frontend/
+npm install
+npm run dev                   # http://localhost:3000
+```
+The frontend calls `http://localhost:8000` unless `NEXT_PUBLIC_API_URL` is set.
+
+A full audit takes about 1–2 minutes: the tiebreaker waits up to 60 s so it does not hit the
+Groq per-minute token limit shared with the detect agent.
+
+---
+
 ## Required secrets
 
 | Variable | Where | Purpose |
 |---|---|---|
-| `GROQ_API_KEY` | Render | detect node + tiebreaker |
-| `GROQ_API_KEY_2` | Render | critique node |
-| `GROQ_API_KEY_3` | Render | verify node |
+| `GROQ_API_KEY` | Render / `.env` | detect node + tiebreaker |
+| `GROQ_API_KEY_2` | Render / `.env` (optional) | critique node; falls back to `GROQ_API_KEY` |
+| `GROQ_API_KEY_3` | Render / `.env` (optional) | verify node; falls back to `GROQ_API_KEY` |
 | `LANGFUSE_PUBLIC_KEY` | Render (optional) | prompt management |
 | `LANGFUSE_SECRET_KEY` | Render (optional) | prompt management |
 | `NEXT_PUBLIC_API_URL` | Vercel | backend URL |
@@ -247,7 +288,29 @@ Uses a lightweight inline Solidity tokeniser (no external library).
 ## Evaluation
 
 The pipeline is benchmarked against the **SmartBugs Curated** dataset (143 Solidity contracts
-with known vulnerabilities). Run the evaluation with:
+with known vulnerabilities).
+
+### Results (all 143 contracts, run 2026-06-07)
+
+| Mode | Precision | Recall | F1 |
+|---|---|---|---|
+| Detector agent, raw (pre-debate) | 22.6% | 49.3% | 0.310 |
+| Slither, raw (MEDIUM+) | 61.1% | 47.8% | 0.537 |
+| Debate, LLM-confirmed findings | 43.4% | 42.5% | 0.429 |
+| **Debate, both engines** | **44.6%** | **55.6%** | **0.495** |
+
+The debate nearly doubles the detector's precision (22.6% → 43.4%, +0.12 F1) by rejecting false
+positives, at a small cost in recall. Adding Slither's confirmed findings raises recall to 55.6%.
+This run used the Llama models the pipeline was configured with at the time; the full report is in
+`backend/evaluation/reports/evaluation_20260607_032323.txt`.
+
+### Running the evaluation
+
+Clone the dataset into the repository root first:
+```bash
+git clone https://github.com/smartbugs/smartbugs-curated.git
+```
+Then, with the backend running:
 
 ```bash
 cd backend/

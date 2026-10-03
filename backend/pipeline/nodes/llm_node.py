@@ -18,8 +18,8 @@ from pipeline import langfuse_client
 
 logger = logging.getLogger(__name__)
 
-LLM_MODEL_SMALL     = "llama-3.1-8b-instant"                       # detect ≤200 lines: 6K TPM
-LLM_MODEL_LARGE     = "meta-llama/llama-4-scout-17b-16e-instruct"  # detect >200 lines + all debate nodes: 30K TPM
+LLM_MODEL_SMALL     = "openai/gpt-oss-120b"                        # detect ≤200 lines (gpt-oss-20b exhausts max_tokens on reasoning)
+LLM_MODEL_LARGE     = "openai/gpt-oss-120b"                        # detect >200 lines + all debate nodes
 LLM_MODEL_DEBATE    = LLM_MODEL_LARGE                              # critique/verify/tiebreaker always use this
 LLM_LINES_THRESHOLD = 200
 LLM_TEMPERATURE     = 0.1

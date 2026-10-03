@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 SEVERITY_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1} # Numeric index for each severity level, used for sorting and comparison. A higher number means more severity.
 
-_DEFAULT_LLM_MODEL = "llama-3.1-8b-instant"
+_DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
 
 
 def _overall_risk(vulns: list[dict]) -> str:
