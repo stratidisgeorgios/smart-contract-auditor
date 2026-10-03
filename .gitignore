@@ -57,3 +57,6 @@ dist/
 *.log
 temp/
 tmp/
+
+# External dataset (separate git repo)
+smartbugs-curated/
