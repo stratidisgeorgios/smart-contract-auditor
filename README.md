@@ -1,10 +1,21 @@
-# Smart Contract Auditor —> Project Overview
+# Smart Contract Auditor: LLM + Static Analysis Pipeline Built with LangGraph
 
 A web app that lets you upload a Solidity smart contract and get back a detailed security report.
 It combines two analysis engines: an LLM (via Groq) for semantic understanding, and Slither for
 precise static analysis. The two results are merged and deduplicated before being sent to the UI.
 
 ![Audit report for FibonacciBalance.sol showing an unrestricted delegatecall vulnerability with impact, highlighted code location, and recommendation](docs/screenshot.png)
+
+## Branches
+
+This repository contains two versions of the auditor:
+
+| Branch | Approach |
+|---|---|
+| [`main`](../../tree/main) | **Single-agent baseline (this branch).** One LLM call plus Slither, merged and deduplicated. |
+| [`agentic-implementation`](../../tree/agentic-implementation) | **Multi-agent debate.** A detector agent proposes findings, a skeptic agent and a defender agent score each one independently, and a tiebreaker agent decides the cases they disagree on. |
+
+Both versions share the same Next.js frontend and Slither integration.
 
 
 ## How it works —> the big picture
@@ -20,7 +31,7 @@ User uploads .sol file
   [FastAPI Backend]
   Runs the audit pipeline:
     1. Validate  →  basic sanity checks on the file
-    2. LLM node  →  sends code to Groq (llama-3.3-70b), gets back vulnerabilities in JSON
+    2. LLM node  →  sends code to Groq (gpt-oss-120b), gets back vulnerabilities in JSON
     3. Slither   →  runs static analysis locally, gets back precise line numbers
     4. Merge     →  deduplicates findings from both engines, builds the final report
         │
@@ -73,8 +84,9 @@ It holds the contract code, intermediate results from each node, and a list of n
 
 Sends the contract to the **Groq API** (free LLM hosting) and asks it to find vulnerabilities.
 
-- Model used: `llama-3.3-70b-versatile`
-- The LLM receives a detailed system prompt from `data/instructions/prompt.txt`
+- Model used: `openai/gpt-oss-120b`
+- The LLM receives a detailed system prompt, fetched from Langfuse (`audit-system-prompt`) with
+  `data/instructions/prompt_v3_smartbugs.txt` as the local fallback
 - It returns a structured JSON with vulnerability descriptions, exploitation scenarios,
   recommendations, and approximate line numbers
 - Because LLMs sometimes wrap JSON in markdown fences, the node strips those before parsing
@@ -197,6 +209,68 @@ Finding the right lines is a three-step fallback:
 The code is colourised by a lightweight inline tokeniser (no external library) that handles
 Solidity keywords, strings, numbers, and comments.
 
+---
 
-The only secret the backend needs is `GROQ_API_KEY`, set manually in the Render dashboard. (already set)
-The only thing the frontend needs is `NEXT_PUBLIC_API_URL` pointing to the Render backend URL. (already set)
+## Running locally
+
+Prerequisites: Python 3.11+, Node.js 18+, and a free [Groq API key](https://console.groq.com/keys).
+
+**Backend**
+```bash
+cd backend/
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env          # then fill in GROQ_API_KEY
+uvicorn main:app --port 8000
+```
+Slither and `solc-select` are installed by `requirements.txt`. Keep the venv activated so they are
+on your `PATH`; the Slither node calls them as subprocesses.
+
+**Frontend**
+```bash
+cd frontend/
+npm install
+npm run dev                   # http://localhost:3000
+```
+The frontend calls `http://localhost:8000` unless `NEXT_PUBLIC_API_URL` is set.
+
+---
+
+## Required secrets
+
+| Variable | Where | Purpose |
+|---|---|---|
+| `GROQ_API_KEY` | Render / `.env` | LLM node |
+| `LANGFUSE_PUBLIC_KEY` | Render / `.env` (optional) | prompt management and tracing |
+| `LANGFUSE_SECRET_KEY` | Render / `.env` (optional) | prompt management and tracing |
+| `NEXT_PUBLIC_API_URL` | Vercel | backend URL |
+
+---
+
+## Evaluation
+
+The pipeline is benchmarked against the **SmartBugs Curated** dataset (Solidity contracts with
+known, labelled vulnerabilities).
+
+### Results (50 contracts, `openai/gpt-oss-20b`, run 2026-05-31)
+
+| Mode | Precision | Recall | F1 |
+|---|---|---|---|
+| LLM only | 85.4% | 62.1% | 0.719 |
+| LLM + Slither | 63.6% | 63.6% | 0.636 |
+
+On this sample the LLM alone is more precise; Slither adds a little recall but also false positives.
+The full report is in `backend/evaluation/reports/evaluation_20260531_162921.txt`.
+
+### Running the evaluation
+
+Clone the dataset into the repository root:
+```bash
+git clone https://github.com/smartbugs/smartbugs-curated.git
+```
+Then, with the backend running:
+```bash
+cd backend/
+python -m evaluation.test_smartbugs
+```

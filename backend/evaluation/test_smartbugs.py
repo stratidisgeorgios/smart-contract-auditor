@@ -18,8 +18,9 @@ from metrics import calculate_metrics
 
 # Configuration
 
-DATASET_PATH = _REPO_ROOT / "smartbugs_curated_dataset" / "dataset"
-GT_FILE      = _REPO_ROOT / "smartbugs_curated_dataset" / "vulnerabilities.json"
+_REPO_ROOT   = Path(__file__).parent.parent.parent
+DATASET_PATH = _REPO_ROOT / "smartbugs-curated" / "dataset"
+GT_FILE      = _REPO_ROOT / "smartbugs-curated" / "vulnerabilities.json"
 BACKEND_URL  = "http://localhost:8000/api/v1/audit"
 
 # Rate-limiting: Groq free tier ~30 req/min. Here we define the rate limits of our model and the delay needed between calls so as to avoid reaching the TPM rates
