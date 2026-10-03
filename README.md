@@ -4,6 +4,8 @@ A web app that lets you upload a Solidity smart contract and get back a detailed
 It combines two analysis engines: an LLM (via Groq) for semantic understanding, and Slither for
 precise static analysis. The two results are merged and deduplicated before being sent to the UI.
 
+![Audit report for FibonacciBalance.sol showing an unrestricted delegatecall vulnerability with impact, highlighted code location, and recommendation](docs/screenshot.png)
+
 
 ## How it works —> the big picture
 

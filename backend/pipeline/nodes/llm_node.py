@@ -12,7 +12,7 @@ from pipeline import langfuse_client
 logger = logging.getLogger(__name__)
 
 # Model configuration 
-LLM_MODEL       = "meta-llama/llama-4-scout-17b-16e-instruct"
+LLM_MODEL       = "openai/gpt-oss-120b"
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS  = 4096
 
